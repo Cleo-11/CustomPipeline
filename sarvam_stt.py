@@ -1,110 +1,105 @@
 """
-sarvam_stt.py — STT via Sarvam REST API (Saaras v3).
-Switched from WebSocket to REST to avoid connection stability issues.
-Buffers 2 seconds of audio then transcribes.
+sarvam_stt.py — Streaming STT via Deepgram SDK v2 (Python 3.9 compatible).
 """
 from __future__ import annotations
 import asyncio
-import base64
 import logging
-import struct
+import os
 from typing import Awaitable, Callable
 
-import httpx
-
-import config
+import websockets
+import json
+import base64
 
 log = logging.getLogger("stt")
 
 OnText = Callable[[str], Awaitable[None]]
 
-STT_URL = "https://api.sarvam.ai/speech-to-text"
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
-
-def _pcm_to_wav(pcm_data: bytes, sample_rate: int = 8000) -> bytes:
-    num_channels = 1
-    bits_per_sample = 16
-    byte_rate = sample_rate * num_channels * bits_per_sample // 8
-    block_align = num_channels * bits_per_sample // 8
-    data_size = len(pcm_data)
-    header = struct.pack(
-        '<4sI4s4sIHHIIHH4sI',
-        b'RIFF', 36 + data_size, b'WAVE',
-        b'fmt ', 16, 1, num_channels,
-        sample_rate, byte_rate, block_align,
-        bits_per_sample, b'data', data_size
-    )
-    return header + pcm_data
+DEEPGRAM_URL = (
+    "wss://api.deepgram.com/v1/listen"
+    "?model=nova-2"
+    "&language=hi"
+    "&encoding=mulaw"
+    "&sample_rate=8000"
+    "&channels=1"
+    "&interim_results=true"
+    "&utterance_end_ms=1000"
+    "&vad_events=true"
+    "&endpointing=300"
+    "&smart_format=true"
+)
 
 
 class SarvamSTT:
     def __init__(self, on_partial: OnText, on_final: OnText):
         self._on_partial = on_partial
         self._on_final = on_final
-        self._audio_buffer = bytearray()
-        self._buffer_lock = asyncio.Lock()
-        self._sender: asyncio.Task | None = None
+        self._ws = None
         self._closed = False
-        # 2 seconds of audio at 8kHz mono PCM16 = 32000 bytes
-        self._send_interval = 3.0
-        self._min_bytes = 8000 * 2 * 2  # 1 second minimum before sending
+        self._reader: asyncio.Task | None = None
 
     async def start(self) -> None:
-        self._sender = asyncio.create_task(
-            self._send_loop(), name="stt-sender")
-        log.info("STT started (REST mode, %s)", config.STT_MODEL)
+        try:
+            self._ws = await websockets.connect(
+                DEEPGRAM_URL,
+                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+            )
+            self._reader = asyncio.create_task(
+                self._read_loop(), name="dg-reader")
+            log.info("STT connected (Deepgram nova-2)")
+        except Exception as e:
+            log.error("STT connect failed: %s", e)
+
+    async def _read_loop(self) -> None:
+        try:
+            async for message in self._ws:
+                data = json.loads(message)
+                msg_type = data.get("type", "")
+
+                if msg_type == "Results":
+                    alts = (data.get("channel", {})
+                            .get("alternatives", [{}]))
+                    transcript = alts[0].get("transcript", "").strip()
+                    if not transcript:
+                        continue
+                    is_final = data.get("is_final", False)
+                    if is_final:
+                        log.info("[STT Final] %s", transcript)
+                        await self._on_final(transcript)
+                    else:
+                        log.debug("[STT Partial] %s", transcript)
+                        await self._on_partial(transcript)
+
+                elif msg_type == "UtteranceEnd":
+                    log.debug("Utterance end received")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.info("STT reader ended: %s", e)
 
     async def send_pcm16(self, pcm16_le: bytes) -> None:
-        if self._closed:
+        pass  # not used
+
+    async def send_ulaw(self, ulaw_bytes: bytes) -> None:
+        if self._closed or self._ws is None:
             return
-        async with self._buffer_lock:
-            self._audio_buffer.extend(pcm16_le)
-
-    async def _send_loop(self) -> None:
-        while not self._closed:
-            await asyncio.sleep(self._send_interval)
-            async with self._buffer_lock:
-                if len(self._audio_buffer) < self._min_bytes:
-                    continue
-                pcm_data = bytes(self._audio_buffer)
-                self._audio_buffer.clear()
-
-            await self._transcribe(pcm_data)
-
-    async def _transcribe(self, pcm_data: bytes) -> None:
         try:
-            wav = _pcm_to_wav(pcm_data, sample_rate=8000)
-            headers = {
-                "api-subscription-key": config.SARVAM_API_KEY,
-            }
-            files = {
-                "file": ("audio.wav", wav, "audio/wav"),
-            }
-            data = {
-                "model": config.STT_MODEL,
-                "language_code": config.STT_LANGUAGE,
-            }
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.post(
-                    STT_URL, headers=headers, files=files, data=data)
-                r.raise_for_status()
-                result = r.json()
-                transcript = result.get("transcript", "").strip()
-                if transcript:
-                    log.info("[STT] %s", transcript)
-                    await self._on_final(transcript)
+            await self._ws.send(ulaw_bytes)
         except Exception as e:
-            log.warning("STT transcribe failed: %s", e)
+            log.warning("STT send failed: %s", e)
 
     async def flush(self) -> None:
-        async with self._buffer_lock:
-            if not self._audio_buffer:
-                return
-            pcm_data = bytes(self._audio_buffer)
-            self._audio_buffer.clear()
-        await self._transcribe(pcm_data)
+        pass
 
     async def close(self) -> None:
         self._closed = True
-        if self._sender:
-            self._sender.cancel()
+        if self._reader:
+            self._reader.cancel()
+        if self._ws is not None:
+            try:
+                await self._ws.close()
+            except Exception:
+                pass

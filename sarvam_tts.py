@@ -47,22 +47,29 @@ class SarvamTTS:
                     log.error("TTS returned no audio. Full response: %s", data)
                     return
 
-                b64 = audios[0]
-                raw = base64.b64decode(b64)
+                raw = base64.b64decode(audios[0])
 
-                # Read actual sample rate from WAV header
+                # Read WAV header
                 src_rate = struct.unpack_from('<I', raw, 24)[0]
-                log.info("TTS got %d bytes, sample rate %dHz", len(raw), src_rate)
+                num_channels = struct.unpack_from('<H', raw, 22)[0]
+                log.info("TTS WAV: %dHz, %dch, %d bytes",
+                         src_rate, num_channels, len(raw))
 
-                # Strip 44-byte WAV header, convert to vobiz frames
-                pcm = np.frombuffer(raw[44:], dtype="<i2")
-                frames = audio.pcm16_to_vobiz_frames(pcm, src_rate=src_rate)
+                # Strip 44-byte WAV header
+                pcm_raw = np.frombuffer(raw[44:], dtype="<i2")
+
+                # If stereo, take left channel only
+                if num_channels == 2:
+                    pcm_raw = pcm_raw[::2]
+
+                frames = audio.pcm16_to_vobiz_frames(pcm_raw, src_rate=src_rate)
                 log.info("TTS producing %d frames", len(frames))
 
                 for frame in frames:
                     yield frame
 
         except httpx.HTTPStatusError as e:
-            log.error("TTS HTTP error %s: %s", e.response.status_code, e.response.text)
+            log.error("TTS HTTP error %s: %s",
+                      e.response.status_code, e.response.text)
         except Exception as e:
             log.error("TTS error: %s", e)

@@ -23,9 +23,8 @@ _client = AsyncOpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
 
 # Flush a chunk to TTS at these boundaries (Devanagari danda included).
 _HARD_BREAKS = "।?!.\n"
-_SOFT_BREAKS = ",;:—"
-_MIN_FIRST_CHUNK = 40     # start speaking fast: flush first clause early
-_MIN_CHUNK = 80           # later chunks can be a touch longer for prosody
+_MIN_FIRST_CHUNK = 120    # start speaking fast: flush first clause early
+_MIN_CHUNK = 180          # later chunks can be a touch longer for prosody
 
 
 async def stream_sentences(messages: list[dict]) -> AsyncIterator[str]:
@@ -39,7 +38,6 @@ async def stream_sentences(messages: list[dict]) -> AsyncIterator[str]:
             temperature=config.LLM_TEMPERATURE,
             stream=True,
             max_tokens=160,
-            extra_body={"options": {"num_ctx": config.LLM_NUM_CTX, "keep_alive": "30m"}},
         )
         async for part in stream:
             delta = part.choices[0].delta.content if part.choices else None
@@ -47,7 +45,7 @@ async def stream_sentences(messages: list[dict]) -> AsyncIterator[str]:
                 continue
             buf += delta
             threshold = _MIN_FIRST_CHUNK if first else _MIN_CHUNK
-            # Flush on a hard break, or on a soft break once we have enough text.
+            # Flush only on a hard sentence break, never mid-sentence.
             while True:
                 idx = _breakpoint(buf, threshold)
                 if idx is None:
@@ -71,12 +69,6 @@ def _breakpoint(text: str, min_len: int) -> int | None:
     for i, ch in enumerate(text):
         if ch in _HARD_BREAKS and i >= min_len:
             return i
-    # Otherwise cut at a soft break once we've buffered enough.
-    if len(text) >= min_len:
-        for i in range(len(text) - 1, -1, -1):
-            if text[i] in _SOFT_BREAKS or text[i] == " ":
-                if i >= min_len // 2:
-                    return i
     return None
 
 

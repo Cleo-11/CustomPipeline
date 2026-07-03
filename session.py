@@ -6,9 +6,8 @@ import asyncio
 import base64
 import json
 import logging
-import time
 
-import numpy as np
+import webrtcvad
 
 import audio
 import config
@@ -39,6 +38,9 @@ class CallSession:
         self._speak_ended_at: float = 0
         self._turn_seq = 0
         self._bargein_run = 0
+        self._last_tts_duration: float = 0.0
+        self._greeting_active: bool = False
+        self._vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
 
     # ---------------------------------------------------------------- events
     async def handle_event(self, raw: str) -> None:
@@ -68,31 +70,43 @@ class CallSession:
         log.info("Call start stream=%s call=%s", self.stream_id, self.call_id)
         await self.stt.start()
         self.messages.append({"role": "assistant", "content": config.GREETING})
-        await self._speak(config.GREETING)
+        self._greeting_active = True
+        self._speak_task = asyncio.create_task(self._speak_greeting())
+
+    async def _speak_greeting(self) -> None:
+        try:
+            await self._speak(config.GREETING)
+        finally:
+            self._greeting_active = False
 
     async def _on_media(self, data: dict) -> None:
         media_payload = (data.get("media") or {}).get("payload")
         if not media_payload:
             return
         ulaw = base64.b64decode(media_payload)
-        pcm = audio.ulaw_to_pcm16(ulaw)
 
-        loop_time = asyncio.get_event_loop().time()
-        cooldown_active = (loop_time - self._speak_ended_at) < 1.0
+        # Always forward audio to STT — Deepgram needs a continuous stream.
+        await self.stt.send_ulaw(ulaw)
 
-        # Don't feed STT while agent is speaking or in cooldown
-        if self._is_speaking or cooldown_active:
+        if self._is_speaking or self._greeting_active:
             return
 
-        # Barge-in check
-        if audio.rms(pcm) > config.BARGEIN_RMS_THRESHOLD:
+        # Barge-in: requires sustained RMS *and* VAD confirmation
+        pcm = audio.ulaw_to_pcm16(ulaw)
+        rms_high = audio.rms(pcm) > config.BARGEIN_RMS_THRESHOLD
+
+        # 20 ms frame at 8 kHz = 160 samples = 320 bytes — valid webrtcvad size
+        try:
+            is_speech = self._vad.is_speech(pcm.tobytes(), 8000)
+        except Exception:
+            is_speech = False
+
+        if rms_high and is_speech:
             self._bargein_run += 1
             if self._bargein_run >= config.BARGEIN_MIN_FRAMES:
                 await self._interrupt()
         else:
             self._bargein_run = 0
-
-        await self.stt.send_pcm16(pcm.astype("<i2").tobytes())
 
     # ---------------------------------------------------------------- STT cb
     async def _on_partial(self, text: str) -> None:
@@ -129,9 +143,6 @@ class CallSession:
     async def _generate_and_speak(self, seq: int) -> None:
         full_reply = ""
         try:
-            if config.THINKING_FILLER:
-                await self._speak(config.THINKING_FILLER)
-
             async for chunk in llm.stream_sentences(self.messages):
                 if seq != self._turn_seq:
                     return
@@ -139,9 +150,11 @@ class CallSession:
                 full_reply += " " + clean
                 if bk:
                     asyncio.create_task(
-                        booking.save_booking(self.call_id or "?", self.caller_name, bk))
+                        booking.save_booking(
+                            self.call_id or "?", self.caller_name, bk))
                 if brochure:
-                    asyncio.create_task(booking.send_brochure(self.caller_number))
+                    asyncio.create_task(
+                        booking.send_brochure(self.caller_number))
                 if clean:
                     log.info("LLM chunk: %s", clean)
                     await self._speak(clean)
@@ -150,17 +163,21 @@ class CallSession:
             raise
         finally:
             if full_reply.strip():
-                self.messages.append({"role": "assistant", "content": full_reply.strip()})
+                self.messages.append(
+                    {"role": "assistant", "content": full_reply.strip()})
                 log.info("PRIYA: %s", full_reply.strip())
 
     async def _speak(self, text: str) -> None:
         log.info("SPEAK called: %s", text[:60])
         self._is_speaking = True
+        self._speak_ended_at = asyncio.get_event_loop().time()
         self._bargein_run = 0
         frame_count = 0
+        total_ulaw_bytes = 0
         try:
             async for frame in self.tts.synthesize(text):
                 frame_count += 1
+                total_ulaw_bytes += len(frame)
                 await self._send({
                     "event": "playAudio",
                     "media": {
@@ -182,6 +199,8 @@ class CallSession:
         except Exception as e:
             log.error("speak error: %s", e)
         finally:
+            # 1 mu-law byte = 1 sample at 8 kHz → duration = bytes / 8000
+            self._last_tts_duration = total_ulaw_bytes / 8000.0
             self._is_speaking = False
             self._speak_ended_at = asyncio.get_event_loop().time()
 
