@@ -10,17 +10,18 @@ import logging
 import webrtcvad
 
 import audio
-import config
-import llm
 import booking
-from sarvam_stt import SarvamSTT
-from sarvam_tts import SarvamTTS
+import config
+from runtime.clauses import stream_clauses
+from runtime.interfaces import LLM, TTS, STTFactory
+from runtime.markers import extract_actions
+from runtime.types import MULAW_8K, AudioFrame, STTEvent
 
 log = logging.getLogger("session")
 
 
 class CallSession:
-    def __init__(self, send_json):
+    def __init__(self, send_json, *, stt_factory: STTFactory, tts: TTS, llm: LLM):
         self._send = send_json
         self.stream_id: str | None = None
         self.call_id: str | None = None
@@ -28,8 +29,9 @@ class CallSession:
         self.caller_name: str = "unknown"
 
         self.messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
-        self.stt = SarvamSTT(on_partial=self._on_partial, on_final=self._on_final)
-        self.tts = SarvamTTS()
+        self.stt = stt_factory(self._on_stt_event)
+        self.tts = tts
+        self._llm = llm
 
         self._pending_user = ""
         self._endpoint_timer: asyncio.Task | None = None
@@ -84,8 +86,8 @@ class CallSession:
             return
         ulaw = base64.b64decode(media_payload)
 
-        # Always forward audio to STT — Deepgram needs a continuous stream.
-        await self.stt.send_ulaw(ulaw)
+        # Always forward audio to STT — the recognizer needs a continuous stream.
+        await self.stt.send_audio(AudioFrame(payload=ulaw, format=MULAW_8K))
 
         if self._is_speaking or self._greeting_active:
             return
@@ -108,6 +110,12 @@ class CallSession:
             self._bargein_run = 0
 
     # ---------------------------------------------------------------- STT cb
+    async def _on_stt_event(self, ev: STTEvent) -> None:
+        if ev.kind == "partial":
+            await self._on_partial(ev.text)
+        elif ev.kind == "final":
+            await self._on_final(ev.text)
+
     async def _on_partial(self, text: str) -> None:
         if self._is_speaking:
             loop_time = asyncio.get_event_loop().time()
@@ -142,10 +150,10 @@ class CallSession:
     async def _generate_and_speak(self, seq: int) -> None:
         full_reply = ""
         try:
-            async for chunk in llm.stream_sentences(self.messages):
+            async for chunk in stream_clauses(self._llm.stream(self.messages)):
                 if seq != self._turn_seq:
                     return
-                clean, bk, brochure = llm.extract_actions(chunk)
+                clean, bk, brochure = extract_actions(chunk)
                 full_reply += " " + clean
                 if bk:
                     asyncio.create_task(
@@ -173,14 +181,14 @@ class CallSession:
         self._bargein_run = 0
         frame_count = 0
         try:
-            async for frame in self.tts.synthesize(text):
+            async for frame in self.tts.synthesize(text, MULAW_8K):
                 frame_count += 1
                 await self._send({
                     "event": "playAudio",
                     "media": {
                         "contentType": "audio/x-mulaw",
                         "sampleRate": 8000,
-                        "payload": base64.b64encode(frame).decode("ascii"),
+                        "payload": base64.b64encode(frame.payload).decode("ascii"),
                     },
                 })
                 await asyncio.sleep(0.02)

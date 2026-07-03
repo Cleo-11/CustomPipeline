@@ -45,8 +45,8 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")          # ignored by Ollama
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2:7b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 
-# Speech models (STT settings live in the Deepgram URL in sarvam_stt.py for now;
-# they move behind a provider interface in ROADMAP.md M2)
+# Speech models (STT connection settings live in providers/stt/deepgram.py;
+# per-agent provider policy arrives in M5)
 TTS_MODEL = os.getenv("TTS_MODEL", "bulbul:v3")
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "shubh")           # v3 default voice
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "hi-IN")

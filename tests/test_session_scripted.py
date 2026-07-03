@@ -1,8 +1,9 @@
 """Scripted-call characterization tests for CallSession.
 
-Drives the orchestrator end-to-end with fake STT/TTS/LLM/socket and asserts
-the outbound Vobiz event sequence. This is the seed of the M4 replay harness:
-same idea (recorded inputs -> asserted event trace), richer machinery later.
+Drives the orchestrator end-to-end and asserts the outbound Vobiz event
+sequence. Since M2, fakes implement the runtime.interfaces Protocols and
+are injected through the constructor — no module monkeypatching. This is
+the seed of the M4 replay harness.
 """
 import asyncio
 import base64
@@ -15,15 +16,16 @@ import pytest
 import audio
 import booking
 import config
-import llm
-import session as session_mod
+from runtime.types import MULAW_8K, AudioFrame, LLMDelta, STTEvent
+from session import CallSession
 
 
 # ---------------------------------------------------------------------- fakes
 class FakeSTT:
-    def __init__(self, on_partial, on_final):
-        self.on_partial = on_partial
-        self.on_final = on_final
+    emits_endpoint = True
+
+    def __init__(self, on_event):
+        self.on_event = on_event
         self.frames = []
         self.started = False
         self.closed = False
@@ -31,31 +33,36 @@ class FakeSTT:
     async def start(self):
         self.started = True
 
-    async def send_ulaw(self, ulaw_bytes):
-        self.frames.append(ulaw_bytes)
+    async def send_audio(self, frame):
+        self.frames.append(frame.payload)
 
     async def close(self):
         self.closed = True
 
 
 class FakeTTS:
+    supports_streaming_input = False
     N_FRAMES = 3
 
     def __init__(self):
         self.texts = []
 
-    async def synthesize(self, text):
+    async def synthesize(self, text, fmt):
+        assert fmt == MULAW_8K
         self.texts.append(text)
         for _ in range(self.N_FRAMES):
-            yield b"\xff" * audio.FRAME_BYTES
+            yield AudioFrame(payload=b"\xff" * audio.FRAME_BYTES, format=MULAW_8K)
 
 
-def scripted_llm(monkeypatch, clauses):
-    async def fake_stream(messages):
-        for clause in clauses:
-            yield clause
+class FakeLLM:
+    """Yields scripted delta streams, one list per user turn."""
 
-    monkeypatch.setattr(llm, "stream_sentences", fake_stream)
+    def __init__(self):
+        self.replies: list[list[str]] = []
+
+    async def stream(self, messages):
+        for part in self.replies.pop(0):
+            yield LLMDelta(text=part)
 
 
 # -------------------------------------------------------------------- helpers
@@ -80,14 +87,12 @@ def events_of(sent, kind):
 def sess(monkeypatch):
     monkeypatch.setattr(config, "ENDPOINT_SILENCE_MS", 20)
     monkeypatch.setattr(config, "BARGEIN_MIN_FRAMES", 3)
-    monkeypatch.setattr(session_mod, "SarvamSTT", FakeSTT)
-    monkeypatch.setattr(session_mod, "SarvamTTS", FakeTTS)
     sent: list[dict] = []
 
     async def send_json(obj):
         sent.append(obj)
 
-    s = session_mod.CallSession(send_json)
+    s = CallSession(send_json, stt_factory=FakeSTT, tts=FakeTTS(), llm=FakeLLM())
     # Deterministic VAD: always classify audio as speech
     s._vad = SimpleNamespace(is_speech=lambda pcm_bytes, rate: True)
     s.sent = sent
@@ -96,7 +101,7 @@ def sess(monkeypatch):
 
 async def run_user_turn(s, text):
     """Deliver an STT final and wait for the endpoint + full reply."""
-    await s.stt.on_final(text)
+    await s.stt.on_event(STTEvent(kind="final", text=text))
     await asyncio.sleep(0.1)  # > patched ENDPOINT_SILENCE_MS
     assert s._speak_task is not None
     await s._speak_task
@@ -121,8 +126,11 @@ async def test_greeting_plays_on_start(sess):
     assert sess.stt.started
 
 
-async def test_normal_turn_event_sequence(sess, monkeypatch):
-    scripted_llm(monkeypatch, ["पहला वाक्य।", "दूसरा वाक्य।"])
+async def test_normal_turn_event_sequence(sess):
+    # First delta ends with a danda past MIN_FIRST_CHUNK so chunking splits
+    # the reply into two spoken clauses, exactly as with a real token stream.
+    first_clause = "प" * 125 + "।"
+    sess._llm.replies = [[first_clause, " दूसरा वाक्य।"]]
     await sess.handle_event(START_EVENT)
     await sess._speak_task
     n_greeting_events = len(sess.sent)
@@ -134,9 +142,13 @@ async def test_normal_turn_event_sequence(sess, monkeypatch):
     # its own checkpoint — 3 frames + 1 checkpoint, twice.
     kinds = [e["event"] for e in turn_events]
     assert kinds == ["playAudio"] * 3 + ["checkpoint"] + ["playAudio"] * 3 + ["checkpoint"]
+    assert sess.tts.texts[1:] == [first_clause, "दूसरा वाक्य।"]
     # History gained the user turn and the joined assistant reply
     assert sess.messages[-2] == {"role": "user", "content": "mujhe 2BHK chahiye"}
-    assert sess.messages[-1] == {"role": "assistant", "content": "पहला वाक्य। दूसरा वाक्य।"}
+    assert sess.messages[-1] == {
+        "role": "assistant",
+        "content": first_clause + " दूसरा वाक्य।",
+    }
 
 
 async def test_media_during_greeting_never_barges_in(sess):
@@ -151,8 +163,8 @@ async def test_media_during_greeting_never_barges_in(sess):
     assert len(sess.stt.frames) == 5
 
 
-async def test_sustained_loud_speech_triggers_clear_audio(sess, monkeypatch):
-    scripted_llm(monkeypatch, ["एक वाक्य।"])
+async def test_sustained_loud_speech_triggers_clear_audio(sess):
+    sess._llm.replies = [["एक वाक्य।"]]
     await sess.handle_event(START_EVENT)
     await sess._speak_task
     await run_user_turn(sess, "haan boliye")
@@ -168,10 +180,9 @@ async def test_sustained_loud_speech_triggers_clear_audio(sess, monkeypatch):
 
 
 async def test_booking_and_brochure_markers_dispatch(sess, monkeypatch):
-    scripted_llm(
-        monkeypatch,
-        ["ठीक है, book कर देती हूं। [[BOOK day=Sunday time=4pm name=Rahul]] [[BROCHURE]]"],
-    )
+    sess._llm.replies = [
+        ["ठीक है, book कर देती हूं। [[BOOK day=Sunday time=4pm name=Rahul]] [[BROCHURE]]"]
+    ]
     saved, brochures = [], []
 
     async def fake_save(call_id, caller, bk):

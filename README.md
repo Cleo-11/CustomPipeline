@@ -134,11 +134,12 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 
 | File | Role |
 |------|------|
-| `server.py` | FastAPI: Vobiz webhooks + `/ws` audio socket |
-| `session.py` | Per-call orchestrator: turn-taking, barge-in, pipelining |
-| `sarvam_stt.py` | Deepgram nova-2 streaming client (name is historical; renamed in ROADMAP.md M2) |
-| `sarvam_tts.py` | Bulbul v3 REST client → Vobiz mu-law frames |
-| `llm.py` | OpenAI-compatible streaming + clause chunker + booking-marker parser |
+| `server.py` | FastAPI: Vobiz webhooks + `/ws` socket + composition root wiring providers |
+| `session.py` | Per-call orchestrator: turn-taking, barge-in, pipelining (vendor-free since M2) |
+| `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
+| `providers/stt/deepgram.py` | Deepgram nova-2 streaming STT adapter |
+| `providers/tts/sarvam.py` | Sarvam Bulbul v3 REST TTS adapter → mu-law frames |
+| `providers/llm/openai_compat.py` | Adapter for any OpenAI-compatible LLM endpoint |
 | `audio.py` | G.711 mu-law codec + resampling (unit-tested) |
 | `booking.py` | Appointment store + WhatsApp brochure via Vobiz |
 | `config.py` | All tunables + KB + Priya system prompt |

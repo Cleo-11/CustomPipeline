@@ -29,6 +29,10 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
 
 import config
+from providers.llm.openai_compat import OpenAICompatLLM
+from providers.stt.deepgram import DeepgramSTT
+from providers.tts.sarvam import SarvamTTS
+from runtime.interfaces import OnSTTEvent
 from session import CallSession
 
 logging.basicConfig(
@@ -38,6 +42,29 @@ logging.basicConfig(
 log = logging.getLogger("server")
 
 app = FastAPI(title="Northern Heights Voice Agent")
+
+# ---------------------------------------------------------------------------
+# Composition root — the only place vendor names and config meet.
+# LLM/TTS adapters are stateless per request and shared across calls; STT
+# holds a live socket per call, so each session builds its own via factory.
+# ---------------------------------------------------------------------------
+_llm = OpenAICompatLLM(
+    base_url=config.LLM_BASE_URL,
+    api_key=config.LLM_API_KEY,
+    model=config.LLM_MODEL,
+    temperature=config.LLM_TEMPERATURE,
+)
+_tts = SarvamTTS(
+    api_key=config.SARVAM_API_KEY,
+    model=config.TTS_MODEL,
+    speaker=config.TTS_SPEAKER,
+    language=config.TTS_LANGUAGE,
+    pace=config.TTS_PACE,
+)
+
+
+def _stt_factory(on_event: OnSTTEvent) -> DeepgramSTT:
+    return DeepgramSTT(api_key=config.DEEPGRAM_API_KEY, on_event=on_event)
 
 
 @app.post("/answer")
@@ -94,7 +121,7 @@ async def ws(websocket: WebSocket):
     async def send_json(obj: dict):
         await websocket.send_text(json.dumps(obj))
 
-    session = CallSession(send_json)
+    session = CallSession(send_json, stt_factory=_stt_factory, tts=_tts, llm=_llm)
     try:
         while True:
             raw = await websocket.receive_text()

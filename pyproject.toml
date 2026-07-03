@@ -32,18 +32,19 @@ dev = [
 ]
 
 [tool.setuptools]
-# Flat module layout until the runtime/providers/transports packages land (M2)
+# Flat modules that remain at the root; orchestration/provider code lives in
+# the runtime/ and providers/ packages (transports/ arrives in M3)
 py-modules = [
     "audio",
     "booking",
     "config",
-    "llm",
     "make_call",
-    "sarvam_stt",
-    "sarvam_tts",
     "server",
     "session",
 ]
+
+[tool.setuptools.packages.find]
+include = ["runtime*", "providers*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
