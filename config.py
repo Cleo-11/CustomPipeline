@@ -21,10 +21,18 @@ def _get(name: str, default: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Credentials / endpoints
 # ---------------------------------------------------------------------------
-SARVAM_API_KEY = os.getenv("SARVAM_API_KEY", "")
-VOBIZ_AUTH_ID = os.getenv("VOBIZ_AUTH_ID", "")
-VOBIZ_AUTH_TOKEN = os.getenv("VOBIZ_AUTH_TOKEN", "")
+# Required — startup fails immediately if missing, instead of limping along
+# and sending empty-string auth headers to providers.
+SARVAM_API_KEY = _get("SARVAM_API_KEY")
+DEEPGRAM_API_KEY = _get("DEEPGRAM_API_KEY")
+VOBIZ_AUTH_ID = _get("VOBIZ_AUTH_ID")
+VOBIZ_AUTH_TOKEN = _get("VOBIZ_AUTH_TOKEN")
 VOBIZ_API_BASE = os.getenv("VOBIZ_API_BASE", "https://api.vobiz.ai/api/v1")
+
+# Shared secret embedded in the wss:// URL that /answer hands to Vobiz and
+# validated on every /ws connect. Any long random string:
+#   python -c "import secrets; print(secrets.token_urlsafe(32))"
+WS_AUTH_TOKEN = _get("WS_AUTH_TOKEN")
 
 # Public hostname Vobiz will reach (no scheme). e.g. agent.mycompany.com
 # In local dev this is your ngrok host, e.g. abc123.ngrok-free.app

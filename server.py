@@ -5,8 +5,10 @@ Exposes:
   POST /answer        -> returns <Stream> XML telling Vobiz to open a WS to /ws
   POST /hangup        -> call-ended webhook (logging / CRM hook)
   POST /stream-status -> stream lifecycle events
-  GET  /health        -> health + the WS url Vobiz should use
-  WS   /ws            -> the bidirectional audio stream; one CallSession each
+  GET  /health        -> liveness check
+  WS   /ws            -> the bidirectional audio stream; one CallSession each.
+                         Requires ?token=<WS_AUTH_TOKEN>, which /answer embeds
+                         in the URL it hands to Vobiz.
 
 Production note: this is ONE server with a native WebSocket route — no internal
 localhost proxy hop (the dev reference uses two servers + ngrok; that extra hop
@@ -21,6 +23,7 @@ call pins one event loop)
 from __future__ import annotations
 import json
 import logging
+import secrets
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, Response
@@ -42,7 +45,7 @@ async def answer(request: Request):
     form = await request.form()
     log.info("answer webhook: From=%s To=%s Dir=%s",
              form.get("From"), form.get("To"), form.get("Direction"))
-    ws_url = f"wss://{config.PUBLIC_HOST}/ws"
+    ws_url = f"wss://{config.PUBLIC_HOST}/ws?token={config.WS_AUTH_TOKEN}"
     status_url = f"https://{config.PUBLIC_HOST}/stream-status"
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -73,11 +76,18 @@ async def stream_status(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "ws_url": f"wss://{config.PUBLIC_HOST}/ws"}
+    # The tokened WS URL is a secret; only Vobiz (via /answer) gets it.
+    return {"status": "ok"}
 
 
 @app.websocket("/ws")
 async def ws(websocket: WebSocket):
+    token = websocket.query_params.get("token", "")
+    if not secrets.compare_digest(token, config.WS_AUTH_TOKEN):
+        log.warning("Rejected /ws connect: bad or missing token")
+        # Closing before accept() makes the ASGI server reject the handshake.
+        await websocket.close(code=1008)
+        return
     await websocket.accept()
     log.info("Vobiz WebSocket connected")
 

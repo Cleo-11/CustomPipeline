@@ -4,18 +4,17 @@ sarvam_stt.py — Streaming STT via Deepgram SDK v2 (Python 3.9 compatible).
 from __future__ import annotations
 import asyncio
 import logging
-import os
 from typing import Awaitable, Callable
 
 import websockets
 import json
 import base64
 
+import config
+
 log = logging.getLogger("stt")
 
 OnText = Callable[[str], Awaitable[None]]
-
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
 
 DEEPGRAM_URL = (
     "wss://api.deepgram.com/v1/listen"
@@ -44,7 +43,7 @@ class SarvamSTT:
         try:
             self._ws = await websockets.connect(
                 DEEPGRAM_URL,
-                additional_headers={"Authorization": f"Token {DEEPGRAM_API_KEY}"}
+                additional_headers={"Authorization": f"Token {config.DEEPGRAM_API_KEY}"}
             )
             self._reader = asyncio.create_task(
                 self._read_loop(), name="dg-reader")
