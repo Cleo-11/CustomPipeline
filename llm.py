@@ -11,7 +11,7 @@ reply, we emit each clause/sentence the moment it completes so TTS can start.
 from __future__ import annotations
 import logging
 import re
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
@@ -27,7 +27,7 @@ _MIN_FIRST_CHUNK = 120    # start speaking fast: flush first clause early
 _MIN_CHUNK = 180          # later chunks can be a touch longer for prosody
 
 
-async def stream_sentences(messages: list[dict]) -> AsyncIterator[str]:
+async def stream_sentences(messages: list[Any]) -> AsyncIterator[str]:
     """Stream the model's reply, yielding speakable chunks as they form."""
     buf = ""
     first = True

@@ -38,7 +38,6 @@ class CallSession:
         self._speak_ended_at: float = 0
         self._turn_seq = 0
         self._bargein_run = 0
-        self._last_tts_duration: float = 0.0
         self._greeting_active: bool = False
         self._vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
 
@@ -173,11 +172,9 @@ class CallSession:
         self._speak_ended_at = asyncio.get_event_loop().time()
         self._bargein_run = 0
         frame_count = 0
-        total_ulaw_bytes = 0
         try:
             async for frame in self.tts.synthesize(text):
                 frame_count += 1
-                total_ulaw_bytes += len(frame)
                 await self._send({
                     "event": "playAudio",
                     "media": {
@@ -199,8 +196,6 @@ class CallSession:
         except Exception as e:
             log.error("speak error: %s", e)
         finally:
-            # 1 mu-law byte = 1 sample at 8 kHz → duration = bytes / 8000
-            self._last_tts_duration = total_ulaw_bytes / 8000.0
             self._is_speaking = False
             self._speak_ended_at = asyncio.get_event_loop().time()
 

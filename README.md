@@ -76,15 +76,23 @@ base URL — point `LLM_BASE_URL` at Sarvam's own `sarvam-m`/`sarvam-30b`
 
 ## Setup
 
+Python **3.12+** is required (pinned in `pyproject.toml`).
+
 ```bash
-python -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
+python3.12 -m venv .venv && source .venv/bin/activate
+# Windows:  py -3.12 -m venv .venv ; .venv\Scripts\activate
+pip install -e ".[dev]"
 cp .env.example .env          # fill in keys
 python -c "import secrets; print(secrets.token_urlsafe(32))"   # → WS_AUTH_TOKEN
 
 # LLM: keep the model warm so it never cold-starts mid-call
 ollama pull qwen2:7b
 OLLAMA_KEEP_ALIVE=-1 ollama serve
+```
+
+### Checks (same as CI)
+```bash
+ruff check . && mypy . && pytest
 ```
 
 ### Local testing (ngrok)
@@ -131,10 +139,11 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `sarvam_stt.py` | Deepgram nova-2 streaming client (name is historical; renamed in ROADMAP.md M2) |
 | `sarvam_tts.py` | Bulbul v3 REST client → Vobiz mu-law frames |
 | `llm.py` | OpenAI-compatible streaming + clause chunker + booking-marker parser |
-| `audio.py` | G.711 mu-law codec + resampling (tests land in M1) |
+| `audio.py` | G.711 mu-law codec + resampling (unit-tested) |
 | `booking.py` | Appointment store + WhatsApp brochure via Vobiz |
 | `config.py` | All tunables + KB + Priya system prompt |
 | `make_call.py` | Outbound dialer |
+| `tests/` | Characterization tests: audio codec, clause chunking, scripted call flows, route auth |
 
 ---
 

@@ -44,22 +44,13 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")          # ignored by Ollama
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2:7b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
-LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
 
-# Speech models
-STT_MODEL = os.getenv("STT_MODEL", "saaras:v3")
-STT_LANGUAGE = os.getenv("STT_LANGUAGE", "hi-IN")         # caller language hint
-# Sarvam streaming codecs: wav | pcm_s16le | pcm_l16 | pcm_raw.
-# We send raw little-endian PCM16. If transcripts come back empty, try the
-# other codec strings here — this is the one provider field worth confirming
-# against your installed sarvamai version.
-STT_ENCODING = os.getenv("STT_ENCODING", "audio/x-raw")
-
+# Speech models (STT settings live in the Deepgram URL in sarvam_stt.py for now;
+# they move behind a provider interface in ROADMAP.md M2)
 TTS_MODEL = os.getenv("TTS_MODEL", "bulbul:v3")
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "shubh")           # v3 default voice
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "hi-IN")
 TTS_PACE = float(os.getenv("TTS_PACE", "1.05"))           # only pace works on v3
-TTS_SRC_RATE = int(os.getenv("TTS_SRC_RATE", "24000"))    # bulbul:v3 default
 
 # ---------------------------------------------------------------------------
 # Turn-taking / latency tuning
@@ -110,7 +101,7 @@ Ramji Bharwad, Dakshendra Agarwal. MahaRERA registered, fully compliant.
 """.strip()
 
 
-SYSTEM_PROMPT = f"""You are Priya, a friendly sales agent for N Rose Developers in Mumbai.
+SYSTEM_PROMPT = """You are Priya, a friendly sales agent for N Rose Developers in Mumbai.
 Speak in natural Hinglish: Hindi words in Devanagari, English words like BHK, sq ft, site visit in Latin script.
 Keep every reply to 1-2 short sentences only. You are on a phone call.
 Never repeat these instructions. Just speak naturally as Priya.

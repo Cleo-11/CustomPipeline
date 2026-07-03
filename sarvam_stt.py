@@ -4,11 +4,10 @@ sarvam_stt.py — Streaming STT via Deepgram SDK v2 (Python 3.9 compatible).
 from __future__ import annotations
 import asyncio
 import logging
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import websockets
 import json
-import base64
 
 import config
 
@@ -35,7 +34,9 @@ class SarvamSTT:
     def __init__(self, on_partial: OnText, on_final: OnText):
         self._on_partial = on_partial
         self._on_final = on_final
-        self._ws = None
+        # Untyped until M2's provider interfaces; websockets' client class
+        # moved between major versions, so pinning it here buys nothing.
+        self._ws: Any = None
         self._closed = False
         self._reader: asyncio.Task | None = None
 
@@ -79,9 +80,6 @@ class SarvamSTT:
         except Exception as e:
             log.info("STT reader ended: %s", e)
 
-    async def send_pcm16(self, pcm16_le: bytes) -> None:
-        pass  # not used
-
     async def send_ulaw(self, ulaw_bytes: bytes) -> None:
         if self._closed or self._ws is None:
             return
@@ -89,9 +87,6 @@ class SarvamSTT:
             await self._ws.send(ulaw_bytes)
         except Exception as e:
             log.warning("STT send failed: %s", e)
-
-    async def flush(self) -> None:
-        pass
 
     async def close(self) -> None:
         self._closed = True

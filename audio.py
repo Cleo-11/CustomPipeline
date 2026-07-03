@@ -2,7 +2,7 @@
 audio.py — Telephony audio bridge (verified round-trip).
 
 Vobiz speaks G.711 mu-law @ 8 kHz, 8-bit, in 20 ms frames (160 bytes).
-Sarvam STT wants raw PCM16; Sarvam TTS returns PCM16 @ 24 kHz.
+TTS returns PCM16 @ 24 kHz; local VAD/energy checks need PCM16 @ 8 kHz.
 This module converts between them with vectorised numpy (no `audioop`,
 so it runs on Python 3.13+ where audioop was removed).
 
@@ -68,13 +68,6 @@ def resample(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     xi = np.linspace(0, len(pcm) - 1, n_out)
     out = np.interp(xi, np.arange(len(pcm)), pcm.astype(np.float64))
     return np.clip(np.round(out), -32768, 32767).astype(np.int16)
-
-
-# ---------------------------------------------------------------------------
-# Convenience: incoming Vobiz frame -> PCM16 @ 8 kHz (for STT + VAD)
-# ---------------------------------------------------------------------------
-def vobiz_to_pcm16_8k(ulaw_bytes: bytes) -> np.ndarray:
-    return ulaw_to_pcm16(ulaw_bytes)
 
 
 # ---------------------------------------------------------------------------
