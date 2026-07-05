@@ -32,8 +32,8 @@ dev = [
 ]
 
 [tool.setuptools]
-# Flat modules that remain at the root; orchestration/provider code lives in
-# the runtime/ and providers/ packages (transports/ arrives in M3)
+# Flat modules that remain at the root; orchestration/provider/transport code
+# lives in the runtime/, providers/, and transports/ packages
 py-modules = [
     "audio",
     "booking",
@@ -44,7 +44,7 @@ py-modules = [
 ]
 
 [tool.setuptools.packages.find]
-include = ["runtime*", "providers*"]
+include = ["runtime*", "providers*", "transports*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

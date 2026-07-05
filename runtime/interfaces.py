@@ -10,13 +10,14 @@ Deliberate M2 deviations from RUNTIME_REDESIGN.md §4:
   the right moment to invert to a pulled event stream, not before.
 - LLM.stream takes plain chat messages; the `tools` parameter arrives with
   the tool registry (M7).
-- Transport stays inline in server.py/session.py until M3.
+- Transport has no dtmf/mark events yet — Vobiz doesn't surface them in the
+  current integration; they join TransportEvent when a carrier needs them.
 """
 from __future__ import annotations
 
 from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
 
-from runtime.types import AudioFormat, AudioFrame, LLMDelta, STTEvent
+from runtime.types import AudioFormat, AudioFrame, LLMDelta, STTEvent, TransportEvent
 
 OnSTTEvent = Callable[[STTEvent], Awaitable[None]]
 
@@ -52,3 +53,23 @@ class TTS(Protocol):
 
 class LLM(Protocol):
     def stream(self, messages: list[Any]) -> AsyncIterator[LLMDelta]: ...
+
+
+class Transport(Protocol):
+    """Carrier adapter: normalizes a duplex media connection to TransportEvents.
+
+    Owns the entire wire protocol — framing, pacing, message shapes. The
+    session pumps events() and calls play/clear/checkpoint; it never sees
+    carrier JSON.
+    """
+
+    @property
+    def audio_format(self) -> AudioFormat: ...
+
+    def events(self) -> AsyncIterator[TransportEvent]: ...
+
+    async def play(self, frame: AudioFrame) -> None: ...
+
+    async def clear(self) -> None: ...
+
+    async def checkpoint(self, name: str) -> None: ...

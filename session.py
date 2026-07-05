@@ -1,10 +1,12 @@
 """
 session.py — The brain of a single call.
+
+Carrier-free since M3: the session pumps TransportEvents from a Transport
+and speaks back through play/clear/checkpoint. It never sees wire JSON,
+base64, or frame pacing — those belong to the transport adapter.
 """
 from __future__ import annotations
 import asyncio
-import base64
-import json
 import logging
 
 import webrtcvad
@@ -13,16 +15,27 @@ import audio
 import booking
 import config
 from runtime.clauses import stream_clauses
-from runtime.interfaces import LLM, TTS, STTFactory
+from runtime.interfaces import LLM, TTS, STTFactory, Transport
 from runtime.markers import extract_actions
-from runtime.types import MULAW_8K, AudioFrame, STTEvent
+from runtime.types import (
+    MULAW_8K,
+    AudioFrame,
+    CallEnded,
+    CallStarted,
+    MediaReceived,
+    OutputCleared,
+    PlaybackFinished,
+    STTEvent,
+    TransportEvent,
+)
 
 log = logging.getLogger("session")
 
 
 class CallSession:
-    def __init__(self, send_json, *, stt_factory: STTFactory, tts: TTS, llm: LLM):
-        self._send = send_json
+    def __init__(self, transport: Transport, *,
+                 stt_factory: STTFactory, tts: TTS, llm: LLM):
+        self._transport = transport
         self.stream_id: str | None = None
         self.call_id: str | None = None
         self.caller_number: str = "unknown"
@@ -44,30 +57,28 @@ class CallSession:
         self._vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
 
     # ---------------------------------------------------------------- events
-    async def handle_event(self, raw: str) -> None:
+    async def run(self) -> None:
+        """Pump transport events until the call ends. The one loop per call."""
         try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            return
-        event = data.get("event")
-        if event == "start":
-            await self._on_start(data)
-        elif event == "media":
-            await self._on_media(data)
-        elif event == "playedStream":
-            self._is_speaking = False
-        elif event == "clearedAudio":
-            self._is_speaking = False
-        elif event == "stop":
+            async for ev in self._transport.events():
+                await self._dispatch(ev)
+                if isinstance(ev, CallEnded):
+                    break
+        finally:
             await self.cleanup()
 
-    async def _on_start(self, data: dict) -> None:
-        self.stream_id = (data.get("streamId") or data.get("StreamID")
-                          or data.get("stream_id") or "default")
-        self.call_id = (data.get("callId") or data.get("CallID")
-                        or data.get("call_id") or "unknown")
-        self.caller_number = (data.get("from") or data.get("From")
-                              or self.caller_number)
+    async def _dispatch(self, ev: TransportEvent) -> None:
+        if isinstance(ev, CallStarted):
+            await self._on_start(ev)
+        elif isinstance(ev, MediaReceived):
+            await self._on_media(ev.frame)
+        elif isinstance(ev, (PlaybackFinished, OutputCleared)):
+            self._is_speaking = False
+
+    async def _on_start(self, ev: CallStarted) -> None:
+        self.stream_id = ev.stream_id
+        self.call_id = ev.call_id
+        self.caller_number = ev.caller
         log.info("Call start stream=%s call=%s", self.stream_id, self.call_id)
         await self.stt.start()
         self.messages.append({"role": "assistant", "content": config.GREETING})
@@ -80,20 +91,15 @@ class CallSession:
         finally:
             self._greeting_active = False
 
-    async def _on_media(self, data: dict) -> None:
-        media_payload = (data.get("media") or {}).get("payload")
-        if not media_payload:
-            return
-        ulaw = base64.b64decode(media_payload)
-
+    async def _on_media(self, frame: AudioFrame) -> None:
         # Always forward audio to STT — the recognizer needs a continuous stream.
-        await self.stt.send_audio(AudioFrame(payload=ulaw, format=MULAW_8K))
+        await self.stt.send_audio(frame)
 
         if self._is_speaking or self._greeting_active:
             return
 
         # Barge-in: requires sustained RMS *and* VAD confirmation
-        pcm = audio.ulaw_to_pcm16(ulaw)
+        pcm = audio.ulaw_to_pcm16(frame.payload)
         rms_high = audio.rms(pcm) > config.BARGEIN_RMS_THRESHOLD
 
         # 20 ms frame at 8 kHz = 160 samples = 320 bytes — valid webrtcvad size
@@ -183,22 +189,10 @@ class CallSession:
         try:
             async for frame in self.tts.synthesize(text, MULAW_8K):
                 frame_count += 1
-                await self._send({
-                    "event": "playAudio",
-                    "media": {
-                        "contentType": "audio/x-mulaw",
-                        "sampleRate": 8000,
-                        "payload": base64.b64encode(frame.payload).decode("ascii"),
-                    },
-                })
-                await asyncio.sleep(0.02)
+                await self._transport.play(frame)
             log.info("SPEAK done: %d frames sent", frame_count)
-            if self.stream_id:
-                await self._send({
-                    "event": "checkpoint",
-                    "streamId": self.stream_id,
-                    "name": f"turn-{self._turn_seq}",
-                })
+            # The transport no-ops this before the call starts.
+            await self._transport.checkpoint(f"turn-{self._turn_seq}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -211,8 +205,7 @@ class CallSession:
         self._bargein_run = 0
         self._is_speaking = False
         self._speak_ended_at = asyncio.get_event_loop().time()
-        if self.stream_id:
-            await self._send({"event": "clearAudio", "streamId": self.stream_id})
+        await self._transport.clear()
         if self._speak_task and not self._speak_task.done():
             self._speak_task.cancel()
         log.info("Barge-in: cleared audio")

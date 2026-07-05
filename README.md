@@ -134,9 +134,11 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 
 | File | Role |
 |------|------|
-| `server.py` | FastAPI: Vobiz webhooks + `/ws` socket + composition root wiring providers |
-| `session.py` | Per-call orchestrator: turn-taking, barge-in, pipelining (vendor-free since M2) |
+| `server.py` | FastAPI: Vobiz webhooks + `/ws` socket + composition root wiring providers/transport |
+| `session.py` | Per-call orchestrator: turn-taking, barge-in, pipelining (vendor- and carrier-free) |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
+| `transports/vobiz.py` | Vobiz WS adapter: event normalization, single-writer sends, deadline frame pacing |
+| `transports/local.py` | In-memory scripted transport for tests/replay |
 | `providers/stt/deepgram.py` | Deepgram nova-2 streaming STT adapter |
 | `providers/tts/sarvam.py` | Sarvam Bulbul v3 REST TTS adapter → mu-law frames |
 | `providers/llm/openai_compat.py` | Adapter for any OpenAI-compatible LLM endpoint |

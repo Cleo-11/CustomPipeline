@@ -21,11 +21,10 @@ Run:  uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1
 call pins one event loop)
 """
 from __future__ import annotations
-import json
 import logging
 import secrets
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse, Response
 
 import config
@@ -34,6 +33,7 @@ from providers.stt.deepgram import DeepgramSTT
 from providers.tts.sarvam import SarvamTTS
 from runtime.interfaces import OnSTTEvent
 from session import CallSession
+from transports.vobiz import VobizTransport
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,20 +118,12 @@ async def ws(websocket: WebSocket):
     await websocket.accept()
     log.info("Vobiz WebSocket connected")
 
-    async def send_json(obj: dict):
-        await websocket.send_text(json.dumps(obj))
-
-    session = CallSession(send_json, stt_factory=_stt_factory, tts=_tts, llm=_llm)
+    transport = VobizTransport(websocket)
+    session = CallSession(transport, stt_factory=_stt_factory, tts=_tts, llm=_llm)
     try:
-        while True:
-            raw = await websocket.receive_text()
-            await session.handle_event(raw)
-    except WebSocketDisconnect:
-        log.info("Vobiz WebSocket disconnected")
+        await session.run()
     except Exception as e:  # noqa: BLE001
-        log.error("WS error: %s", e)
-    finally:
-        await session.cleanup()
+        log.error("WS session error: %s", e)
 
 
 if __name__ == "__main__":

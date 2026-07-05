@@ -48,3 +48,37 @@ class LLMDelta:
     """One increment of a streamed model reply. Tool-call deltas land in M7."""
 
     text: str
+
+
+# ---------------------------------------------------------------------------
+# Transport events — the single internal contract every carrier adapter
+# normalizes to. The session never sees carrier JSON.
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CallStarted:
+    stream_id: str
+    call_id: str
+    caller: str
+
+
+@dataclass(frozen=True)
+class MediaReceived:
+    frame: AudioFrame
+
+
+@dataclass(frozen=True)
+class PlaybackFinished:
+    """The transport finished playing everything sent so far."""
+
+
+@dataclass(frozen=True)
+class OutputCleared:
+    """Buffered output was dropped (barge-in acknowledgement)."""
+
+
+@dataclass(frozen=True)
+class CallEnded:
+    pass
+
+
+TransportEvent = CallStarted | MediaReceived | PlaybackFinished | OutputCleared | CallEnded
