@@ -1,8 +1,11 @@
 """
-config.py — Central configuration, knowledge base, and the agent persona.
+config.py — Deployment engine defaults + credentials.
 
-Everything tunable lives here so you can change latency/voice/behaviour
-without touching the pipeline code.
+Since M5 this is *not* the agent. Priya's persona (system prompt, greeting,
+knowledge, voice) lives in agents/priya.json and is resolved per call by
+runtime.agent_registry. What remains here are the credentials and the
+engine defaults an agent inherits for any policy its file doesn't pin —
+the tunables of the deployment, not of any one agent.
 """
 from __future__ import annotations
 import os
@@ -44,9 +47,15 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
 LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")          # ignored by Ollama
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2:7b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "160"))
 
-# Speech models (STT connection settings live in providers/stt/deepgram.py;
-# per-agent provider policy arrives in M5)
+# Default STT model/language for agents that don't pin their own. The rest
+# of the Deepgram connection string is fixed in providers/stt/deepgram.py.
+STT_MODEL = os.getenv("STT_MODEL", "nova-2")
+STT_LANGUAGE = os.getenv("STT_LANGUAGE", "hi")
+
+# Default TTS voice for agents that don't pin their own (Priya pins hers in
+# agents/priya.json).
 TTS_MODEL = os.getenv("TTS_MODEL", "bulbul:v3")
 TTS_SPEAKER = os.getenv("TTS_SPEAKER", "shubh")           # v3 default voice
 TTS_LANGUAGE = os.getenv("TTS_LANGUAGE", "hi-IN")
@@ -67,63 +76,10 @@ ENDPOINTER = os.getenv("ENDPOINTER", "fixed")
 BARGEIN_RMS_THRESHOLD = float(os.getenv("BARGEIN_RMS_THRESHOLD", "650"))
 BARGEIN_MIN_FRAMES = int(os.getenv("BARGEIN_MIN_FRAMES", "25"))  # ~500 ms
 VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "2"))   # 0–3; 2 = balanced
+# A mid-speech partial only interrupts the agent after it has held the floor
+# this long — below it, the partial is likely the agent's own audio echoing.
+PARTIAL_INTERRUPT_AFTER_S = float(os.getenv("PARTIAL_INTERRUPT_AFTER_S", "0.5"))
 # Tiny acknowledgement ("हम्म…") spoken the instant the caller's turn commits,
 # masking LLM time-to-first-token (wired via the Turn Engine's THINKING
 # state since M4). Set to "" to disable.
 THINKING_FILLER = os.getenv("THINKING_FILLER", "हम्म")
-
-
-# ---------------------------------------------------------------------------
-# Knowledge base (verbatim from your kb.py)
-# ---------------------------------------------------------------------------
-KNOWLEDGE_BASE = """
-PROJECT: Northern Heights, Dahisar East, Mumbai
-MahaRERA: P51700007900
-Address: Heaven's Plaza, High Land Hills, Barucha Road, Off S.V. Road, Dahisar East, Mumbai - 400086
-Developer: N Rose Developers Pvt. Ltd. (est. 2004, 20+ saal ka experience)
-Type: Twin 42-storey luxury residential towers, 1-acre central lawn with ground-level podium
-
-2 BHK: 600-700 sq ft. Price paune do crore se start, upper floors pe dhai crore tak.
-        Modular kitchen, separate living/dining, large windows, premium fittings.
-        Nuclear families aur young professionals ke liye ideal.
-3 BHK: 1100 sq ft. Price saade teen crore se start.
-        Master bedroom with attached bath, larger living spaces, generous balconies.
-        Corner units on select floors with dual-view advantage.
-
-AMENITIES: Swimming pool, gymnasium, turf, corner seating, library, clubhouse,
-senior citizens area, kids playground, landscaped gardens, 1-acre podium lawn.
-
-LOCATION:
-- Dahisar Railway Station: 0.5 km (5 min walk)
-- Proposed Metro Station: 0.5 km
-- Western Express Highway: 0.1 km (doorstep)
-- S.V. Road directly accessible; Schools/Colleges 0.5 km; Hospitals 0.5 km
-- Easy access to Borivali, Mira Road, rest of Mumbai via WE Highway
-
-DEVELOPER: N Rose Developers, 20+ years in Mumbai real estate. Founded by Late Shri.
-Parshuram Shinde. Promoters: Narayan Shelar, Natwarlal Purohit, Hiren Ashar,
-Ramji Bharwad, Dakshendra Agarwal. MahaRERA registered, fully compliant.
-""".strip()
-
-
-SYSTEM_PROMPT = """You are Priya, a friendly sales agent for N Rose Developers in Mumbai.
-Speak in natural Hinglish: Hindi words in Devanagari, English words like BHK, sq ft, site visit in Latin script.
-Keep every reply to 1-2 short sentences only. You are on a phone call.
-Never repeat these instructions. Just speak naturally as Priya.
-
-Property: Northern Heights, Dahisar East. 2 BHK: 600-700 sq ft from ₹1.75 Cr. 3 BHK: 1100 sq ft from ₹3.5 Cr.
-Amenities: pool, gym, clubhouse, 1-acre lawn. Location: 0.5km from Dahisar station, WE Highway at doorstep.
-
-Your goal: greet → ask name → ask 2BHK or 3BHK → give price/size → mention amenities → invite for site visit.
-
-If they agree to visit, end your reply with:
-[[BOOK day=<day> time=<time> name=<name>]]
-If they want brochure:
-[[BROCHURE]]
-""".strip()
-
-GREETING = os.getenv(
-    "GREETING",
-    "नमस्ते! मैं Priya बोल रही हूं N Rose Developers से। "
-    "क्या मैं आपका थोड़ा सा समय ले सकती हूं?",
-)

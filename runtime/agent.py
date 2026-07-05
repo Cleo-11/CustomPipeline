@@ -1,0 +1,113 @@
+"""runtime/agent.py — the agent as a data record, not code.
+
+The single largest structural change of the redesign (§6): the process is
+an engine; an agent is a row. `AgentConfig` is that row — persona, voice,
+and the provider/turn *policies* a call runs under. It carries no secrets:
+API keys resolve separately (per-tenant, eventually), so the same record
+is safe to ship to a control plane or store in a database.
+
+This module is pure data. It imports no vendor, no I/O, and no `config`.
+`from_dict` builds a record from a parsed JSON spec, filling any section
+the spec omits from caller-supplied engine defaults — so an agent file can
+pin only what makes it distinctive (persona, voice) and inherit the
+deployment's latency/model defaults for the rest.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+from runtime.turn_engine import TurnPolicy
+
+
+@dataclass(frozen=True)
+class VoiceConfig:
+    """TTS voice policy — how the agent sounds."""
+
+    model: str
+    speaker: str
+    language: str
+    pace: float
+
+
+@dataclass(frozen=True)
+class STTPolicy:
+    """Recognizer policy. `endpointer` = who decides end-of-turn:
+    "fixed" (our silence timer) or "provider" (trust the STT's own
+    endpoint events, capability-gated on STT.emits_endpoint)."""
+
+    model: str
+    language: str
+    endpointer: str
+
+
+@dataclass(frozen=True)
+class LLMPolicy:
+    """Inference policy. `base_url` selects the OpenAI-compatible server;
+    the api key is injected at the composition root, never stored here."""
+
+    base_url: str
+    model: str
+    temperature: float
+    max_tokens: int
+
+
+@dataclass(frozen=True)
+class TurnSettings:
+    """Turn-taking feel. A superset of the engine's TurnPolicy: it also
+    holds the knobs the *session* applies before the engine sees a frame
+    (RMS gate, VAD aggressiveness) and the endpoint silence window."""
+
+    endpoint_silence_ms: int
+    bargein_rms_threshold: float
+    bargein_min_frames: int
+    vad_aggressiveness: int
+    partial_interrupt_after_s: float
+    filler: str
+
+    def engine_policy(self) -> TurnPolicy:
+        """The subset the pure Turn Engine consumes."""
+        return TurnPolicy(
+            bargein_min_frames=self.bargein_min_frames,
+            partial_interrupt_after_s=self.partial_interrupt_after_s,
+            filler=self.filler,
+        )
+
+
+@dataclass(frozen=True)
+class AgentConfig:
+    agent_id: str
+    tenant_id: str
+    system_prompt: str
+    greeting: str
+    # Carried with the agent; not yet injected into the prompt — that lands
+    # with the Context Compiler subsystem. Kept here so an agent's knowledge
+    # travels with its record instead of rotting in a global constant.
+    knowledge: str
+    voice: VoiceConfig
+    stt: STTPolicy
+    llm: LLMPolicy
+    turn: TurnSettings
+    # tools: list[ToolSpec] arrives with the tool registry (M7). Until then
+    # the [[BOOK]]/[[BROCHURE]] markers in system_prompt are the mechanism.
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any]) -> AgentConfig:
+        """Build from a parsed spec. Persona fields are required; each
+        policy section is merged over `defaults[section]`, so an omitted or
+        partial section inherits the deployment's engine defaults."""
+
+        def section(name: str) -> dict[str, Any]:
+            return {**defaults[name], **data.get(name, {})}
+
+        return cls(
+            agent_id=data["agent_id"],
+            tenant_id=data.get("tenant_id", "default"),
+            system_prompt=data["system_prompt"],
+            greeting=data["greeting"],
+            knowledge=data.get("knowledge", ""),
+            voice=VoiceConfig(**section("voice")),
+            stt=STTPolicy(**section("stt")),
+            llm=LLMPolicy(**section("llm")),
+            turn=TurnSettings(**section("turn")),
+        )

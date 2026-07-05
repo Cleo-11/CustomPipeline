@@ -18,7 +18,7 @@ import webrtcvad
 
 import audio
 import booking
-import config
+from runtime.agent import AgentConfig
 from runtime.clauses import stream_clauses
 from runtime.endpointing import Endpointer, FixedSilenceEndpointer, ProviderEndpointer
 from runtime.interfaces import LLM, TTS, STTFactory, Transport
@@ -30,7 +30,6 @@ from runtime.turn_engine import (
     Intent,
     PlayGreeting,
     TurnEngine,
-    TurnPolicy,
 )
 from runtime.types import (
     MULAW_8K,
@@ -47,35 +46,32 @@ log = logging.getLogger("session")
 
 
 class CallSession:
-    def __init__(self, transport: Transport, *,
+    def __init__(self, transport: Transport, *, agent: AgentConfig,
                  stt_factory: STTFactory, tts: TTS, llm: LLM,
                  engine: TurnEngine | None = None):
         self._transport = transport
+        self.agent = agent
         self.stream_id: str | None = None
         self.call_id: str | None = None
         self.caller_number: str = "unknown"
         self.caller_name: str = "unknown"
 
-        self.messages: list[dict] = [{"role": "system", "content": config.SYSTEM_PROMPT}]
+        self.messages: list[dict] = [{"role": "system", "content": agent.system_prompt}]
         self.stt = stt_factory(self._on_stt_event)
         self.tts = tts
         self._llm = llm
         self._engine = engine if engine is not None else TurnEngine(
-            policy=TurnPolicy(
-                bargein_min_frames=config.BARGEIN_MIN_FRAMES,
-                partial_interrupt_after_s=0.5,
-                filler=config.THINKING_FILLER,
-            ),
+            policy=agent.turn.engine_policy(),
             endpointer=self._pick_endpointer(),
         )
 
         self._endpoint_timer: asyncio.Task | None = None
         self._speak_task: asyncio.Task | None = None
-        self._vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
+        self._vad = webrtcvad.Vad(agent.turn.vad_aggressiveness)
 
     def _pick_endpointer(self) -> Endpointer:
-        delay_s = config.ENDPOINT_SILENCE_MS / 1000
-        if config.ENDPOINTER == "provider" and self.stt.emits_endpoint:
+        delay_s = self.agent.turn.endpoint_silence_ms / 1000
+        if self.agent.stt.endpointer == "provider" and self.stt.emits_endpoint:
             return ProviderEndpointer(fallback_delay_s=delay_s)
         return FixedSilenceEndpointer(delay_s=delay_s)
 
@@ -119,7 +115,7 @@ class CallSession:
         # Normalize the frame to a speech verdict; the engine owns what the
         # verdict *means* (barge-in counting, greeting immunity).
         pcm = audio.ulaw_to_pcm16(frame.payload)
-        rms_high = audio.rms(pcm) > config.BARGEIN_RMS_THRESHOLD
+        rms_high = audio.rms(pcm) > self.agent.turn.bargein_rms_threshold
         # 20 ms frame at 8 kHz = 160 samples = 320 bytes — valid webrtcvad size
         try:
             vad_speech = self._vad.is_speech(pcm.tobytes(), 8000)
@@ -140,7 +136,7 @@ class CallSession:
     async def _execute(self, intents: list[Intent]) -> None:
         for intent in intents:
             if isinstance(intent, PlayGreeting):
-                self.messages.append({"role": "assistant", "content": config.GREETING})
+                self.messages.append({"role": "assistant", "content": self.agent.greeting})
                 self._speak_task = asyncio.create_task(self._speak_greeting())
             elif isinstance(intent, ArmEndpointTimer):
                 if self._endpoint_timer and not self._endpoint_timer.done():
@@ -177,7 +173,7 @@ class CallSession:
     async def _speak_greeting(self) -> None:
         frames = 0
         try:
-            frames = await self._speak(config.GREETING, 0)
+            frames = await self._speak(self.agent.greeting, 0)
         finally:
             await self._execute(
                 self._engine.speaking_finished(0, any_audio=frames > 0))
@@ -196,7 +192,7 @@ class CallSession:
         first_task = asyncio.create_task(_next_clause())
         try:
             if play_filler:
-                frames += await self._speak(config.THINKING_FILLER, seq)
+                frames += await self._speak(self.agent.turn.filler, seq)
             chunk = await first_task
             while chunk is not None:
                 if self._engine.is_stale(seq):

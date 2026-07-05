@@ -18,19 +18,23 @@ from runtime.types import AudioFrame, STTEvent
 
 log = logging.getLogger("providers.stt.deepgram")
 
-DEEPGRAM_URL = (
-    "wss://api.deepgram.com/v1/listen"
-    "?model=nova-2"
-    "&language=hi"
-    "&encoding=mulaw"
-    "&sample_rate=8000"
-    "&channels=1"
-    "&interim_results=true"
-    "&utterance_end_ms=1000"
-    "&vad_events=true"
-    "&endpointing=300"
-    "&smart_format=true"
-)
+def _build_url(model: str, language: str) -> str:
+    """Model/language come from the agent's STT policy; the rest of the
+    connection contract (mu-law 8k mono, interims, VAD/endpoint events) is
+    fixed by how this runtime consumes Deepgram."""
+    return (
+        "wss://api.deepgram.com/v1/listen"
+        f"?model={model}"
+        f"&language={language}"
+        "&encoding=mulaw"
+        "&sample_rate=8000"
+        "&channels=1"
+        "&interim_results=true"
+        "&utterance_end_ms=1000"
+        "&vad_events=true"
+        "&endpointing=300"
+        "&smart_format=true"
+    )
 
 
 class DeepgramSTT:
@@ -40,9 +44,11 @@ class DeepgramSTT:
     # ProviderEndpointer starts trusting them in M4.
     emits_endpoint = True
 
-    def __init__(self, *, api_key: str, on_event: OnSTTEvent) -> None:
+    def __init__(self, *, api_key: str, on_event: OnSTTEvent,
+                 model: str = "nova-2", language: str = "hi") -> None:
         self._api_key = api_key
         self._on_event = on_event
+        self._url = _build_url(model, language)
         # Untyped: websockets' client class moved between major versions,
         # so pinning it here buys nothing.
         self._ws: Any = None
@@ -52,7 +58,7 @@ class DeepgramSTT:
     async def start(self) -> None:
         try:
             self._ws = await websockets.connect(
-                DEEPGRAM_URL,
+                self._url,
                 additional_headers={"Authorization": f"Token {self._api_key}"},
             )
             self._reader = asyncio.create_task(self._read_loop(), name="dg-reader")

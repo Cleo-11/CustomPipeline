@@ -15,6 +15,7 @@ import pytest
 import audio
 import booking
 import config
+from runtime import agent_registry
 from runtime.types import (
     MULAW_8K,
     AudioFrame,
@@ -108,11 +109,14 @@ def op_kinds(transport):
 
 
 def make_sess(monkeypatch, *, filler="", tts=None):
+    # These are engine defaults the Priya agent inherits, so patching config
+    # before resolve() flows them into the resolved AgentConfig.
     monkeypatch.setattr(config, "ENDPOINT_SILENCE_MS", 20)
     monkeypatch.setattr(config, "BARGEIN_MIN_FRAMES", 3)
     monkeypatch.setattr(config, "THINKING_FILLER", filler)
+    agent = agent_registry.resolve()
     transport = LocalTransport()
-    s = CallSession(transport, stt_factory=FakeSTT,
+    s = CallSession(transport, agent=agent, stt_factory=FakeSTT,
                     tts=tts or FakeTTS(), llm=FakeLLM())
     # Deterministic VAD: always classify audio as speech
     s._vad = SimpleNamespace(is_speech=lambda pcm_bytes, rate: True)
@@ -154,7 +158,7 @@ async def test_greeting_plays_on_start(sess):
     assert len(frame.payload) == audio.FRAME_BYTES
     assert frame.format == MULAW_8K
     # Greeting is recorded in history; STT is running
-    assert sess.messages[1] == {"role": "assistant", "content": config.GREETING}
+    assert sess.messages[1] == {"role": "assistant", "content": sess.agent.greeting}
     assert sess.stt.started
 
 
@@ -249,7 +253,7 @@ async def test_filler_masks_thinking_and_stays_out_of_history(monkeypatch):
     await run_user_turn(sess, "haan")
 
     # Filler is spoken before the reply clause, but never enters history.
-    assert sess.tts.texts == [config.GREETING, "हम्म", "एक वाक्य।"]
+    assert sess.tts.texts == [sess.agent.greeting, "हम्म", "एक वाक्य।"]
     assert sess.messages[-1] == {"role": "assistant", "content": "एक वाक्य।"}
     assert all(m["content"] != "हम्म" for m in sess.messages)
 

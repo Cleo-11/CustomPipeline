@@ -23,6 +23,7 @@ call pins one event loop)
 from __future__ import annotations
 import logging
 import secrets
+from dataclasses import dataclass
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse, Response
@@ -31,7 +32,9 @@ import config
 from providers.llm.openai_compat import OpenAICompatLLM
 from providers.stt.deepgram import DeepgramSTT
 from providers.tts.sarvam import SarvamTTS
-from runtime.interfaces import OnSTTEvent
+from runtime.agent import AgentConfig
+from runtime.agent_registry import resolve as resolve_agent
+from runtime.interfaces import LLM, TTS, OnSTTEvent, STTFactory
 from session import CallSession
 from transports.vobiz import VobizTransport
 
@@ -43,28 +46,55 @@ log = logging.getLogger("server")
 
 app = FastAPI(title="Northern Heights Voice Agent")
 
+
 # ---------------------------------------------------------------------------
-# Composition root — the only place vendor names and config meet.
-# LLM/TTS adapters are stateless per request and shared across calls; STT
-# holds a live socket per call, so each session builds its own via factory.
+# Composition root — the only place vendor names, agent policy, and secrets
+# meet. Providers are built from the resolved AgentConfig's policy; secrets
+# come from config (per-tenant secret resolution arrives with tenancy, P3).
 # ---------------------------------------------------------------------------
-_llm = OpenAICompatLLM(
-    base_url=config.LLM_BASE_URL,
-    api_key=config.LLM_API_KEY,
-    model=config.LLM_MODEL,
-    temperature=config.LLM_TEMPERATURE,
-)
-_tts = SarvamTTS(
-    api_key=config.SARVAM_API_KEY,
-    model=config.TTS_MODEL,
-    speaker=config.TTS_SPEAKER,
-    language=config.TTS_LANGUAGE,
-    pace=config.TTS_PACE,
-)
+@dataclass(frozen=True)
+class _Providers:
+    stt_factory: STTFactory
+    tts: TTS
+    llm: LLM
 
 
-def _stt_factory(on_event: OnSTTEvent) -> DeepgramSTT:
-    return DeepgramSTT(api_key=config.DEEPGRAM_API_KEY, on_event=on_event)
+# One provider set per agent, built lazily and reused across that agent's
+# calls (LLM/TTS hold connection pools worth keeping warm; STT is still
+# per-call via the factory). In tenancy this key becomes (tenant, agent).
+_provider_cache: dict[str, _Providers] = {}
+
+
+def _build_providers(agent: AgentConfig) -> _Providers:
+    cached = _provider_cache.get(agent.agent_id)
+    if cached is not None:
+        return cached
+    llm = OpenAICompatLLM(
+        base_url=agent.llm.base_url,
+        api_key=config.LLM_API_KEY,
+        model=agent.llm.model,
+        temperature=agent.llm.temperature,
+        max_tokens=agent.llm.max_tokens,
+    )
+    tts = SarvamTTS(
+        api_key=config.SARVAM_API_KEY,
+        model=agent.voice.model,
+        speaker=agent.voice.speaker,
+        language=agent.voice.language,
+        pace=agent.voice.pace,
+    )
+
+    def stt_factory(on_event: OnSTTEvent) -> DeepgramSTT:
+        return DeepgramSTT(
+            api_key=config.DEEPGRAM_API_KEY,
+            on_event=on_event,
+            model=agent.stt.model,
+            language=agent.stt.language,
+        )
+
+    providers = _Providers(stt_factory=stt_factory, tts=tts, llm=llm)
+    _provider_cache[agent.agent_id] = providers
+    return providers
 
 
 @app.post("/answer")
@@ -72,7 +102,13 @@ async def answer(request: Request):
     form = await request.form()
     log.info("answer webhook: From=%s To=%s Dir=%s",
              form.get("From"), form.get("To"), form.get("Direction"))
+    # Agent selection rides through our own URLs, so it doesn't depend on the
+    # carrier echoing custom params: make_call adds ?agent=, we forward it to
+    # /ws, which resolves it. Absent → the default agent.
+    agent_id = request.query_params.get("agent")
     ws_url = f"wss://{config.PUBLIC_HOST}/ws?token={config.WS_AUTH_TOKEN}"
+    if agent_id:
+        ws_url += f"&agent={agent_id}"
     status_url = f"https://{config.PUBLIC_HOST}/stream-status"
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -116,10 +152,16 @@ async def ws(websocket: WebSocket):
         await websocket.close(code=1008)
         return
     await websocket.accept()
-    log.info("Vobiz WebSocket connected")
+
+    agent = resolve_agent(agent_id=websocket.query_params.get("agent"))
+    providers = _build_providers(agent)
+    log.info("Vobiz WebSocket connected (agent=%s)", agent.agent_id)
 
     transport = VobizTransport(websocket)
-    session = CallSession(transport, stt_factory=_stt_factory, tts=_tts, llm=_llm)
+    session = CallSession(
+        transport, agent=agent,
+        stt_factory=providers.stt_factory, tts=providers.tts, llm=providers.llm,
+    )
     try:
         await session.run()
     except Exception as e:  # noqa: BLE001

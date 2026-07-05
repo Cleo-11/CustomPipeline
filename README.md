@@ -60,11 +60,11 @@ Two cheap tricks wired in:
 
 Your original prompt had Priya speak **romanised** Hinglish (`"Aap kaunse..."`).
 TTS engines frequently mispronounce romanised Hindi — they read it as English.
-So the system prompt in `config.py` instructs the model to write **Hindi words
-in Devanagari** and keep only genuinely-English tokens (brand names, "BHK",
-"sq ft", numbers) in Latin. Bulbul handles that code-mixed script far more
-naturally. The persona, 1–2 sentence limit, flow, objections and KB are all
-preserved from your script.
+So Priya's system prompt (in `agents/priya.json`) instructs the model to write
+**Hindi words in Devanagari** and keep only genuinely-English tokens (brand
+names, "BHK", "sq ft", numbers) in Latin. Bulbul handles that code-mixed script
+far more naturally. The persona, 1–2 sentence limit, flow, objections and KB are
+all preserved from your script.
 
 One honest caveat: **Qwen2:7B is the weakest link for "very, very human"
 Hinglish.** It works, but for noticeably better code-mix try
@@ -138,6 +138,9 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `session.py` | Per-call wiring: engine events in, engine intents out, LLM→TTS reply pipeline |
 | `runtime/turn_engine.py` | The turn-taking state machine — pure, I/O-free, replay-testable |
 | `runtime/endpointing.py` | Pluggable end-of-turn strategies (fixed silence / provider-trusting) |
+| `runtime/agent.py` | `AgentConfig`: the agent as a data record (persona + voice/STT/LLM/turn policy) |
+| `runtime/agent_registry.py` | Resolves a call to its `AgentConfig`, defaulting to Priya |
+| `agents/priya.json` | Priya/Northern Heights — the reference agent, as data |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
 | `transports/vobiz.py` | Vobiz WS adapter: event normalization, single-writer sends, deadline frame pacing |
 | `transports/local.py` | In-memory scripted transport for tests/replay |
@@ -146,7 +149,7 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `providers/llm/openai_compat.py` | Adapter for any OpenAI-compatible LLM endpoint |
 | `audio.py` | G.711 mu-law codec + resampling (unit-tested) |
 | `booking.py` | Appointment store + WhatsApp brochure via Vobiz |
-| `config.py` | All tunables + KB + Priya system prompt |
+| `config.py` | Deployment engine defaults + credentials (no longer the agent) |
 | `make_call.py` | Outbound dialer |
 | `tests/` | Characterization tests: audio codec, clause chunking, scripted call flows, route auth |
 
