@@ -55,16 +55,21 @@ TTS_PACE = float(os.getenv("TTS_PACE", "1.05"))           # only pace works on v
 # ---------------------------------------------------------------------------
 # Turn-taking / latency tuning
 # ---------------------------------------------------------------------------
-# Silence after last final transcript before we treat the turn as finished
-# (Sarvam VAD also signals this; this is the safety fallback).
+# Silence after last final transcript before we treat the turn as finished.
 ENDPOINT_SILENCE_MS = int(os.getenv("ENDPOINT_SILENCE_MS", "550"))
+# End-of-turn strategy: "fixed" = the silence window above; "provider" =
+# trust the STT's endpoint events (Deepgram UtteranceEnd) with the silence
+# window kept armed as a safety fallback. Capability-gated: falls back to
+# fixed when the STT doesn't emit endpoints.
+ENDPOINTER = os.getenv("ENDPOINTER", "fixed")
 # Barge-in: energy threshold + consecutive 20 ms frames of speech that must
 # arrive while the agent is talking before we cut its audio.
 BARGEIN_RMS_THRESHOLD = float(os.getenv("BARGEIN_RMS_THRESHOLD", "650"))
 BARGEIN_MIN_FRAMES = int(os.getenv("BARGEIN_MIN_FRAMES", "25"))  # ~500 ms
 VAD_AGGRESSIVENESS = int(os.getenv("VAD_AGGRESSIVENESS", "2"))   # 0–3; 2 = balanced
-# Play a tiny acknowledgement ("हम्म…") the instant the caller stops, to mask
-# LLM time-to-first-token. Set to "" to disable.
+# Tiny acknowledgement ("हम्म…") spoken the instant the caller's turn commits,
+# masking LLM time-to-first-token (wired via the Turn Engine's THINKING
+# state since M4). Set to "" to disable.
 THINKING_FILLER = os.getenv("THINKING_FILLER", "हम्म")
 
 

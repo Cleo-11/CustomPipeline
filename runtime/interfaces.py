@@ -4,10 +4,12 @@ The orchestration core types against these and never names a vendor.
 Swapping a provider means writing one adapter in providers/ and wiring it
 at the composition root (server.py today); conversation logic is untouched.
 
-Deliberate M2 deviations from RUNTIME_REDESIGN.md §4:
+Deliberate deviations from RUNTIME_REDESIGN.md §4:
 - STT delivers events through an async callback instead of an `events()`
-  iterator. CallSession is callback-shaped today; the Turn Engine (M4) is
-  the right moment to invert to a pulled event stream, not before.
+  iterator. Since M4 the callback is a thin bridge into the Turn Engine
+  (which is where the rules live), so inverting to a pulled stream buys
+  nothing yet; it happens when something concrete needs it — the event
+  bus (M6) or a second concurrent STT.
 - LLM.stream takes plain chat messages; the `tools` parameter arrives with
   the tool registry (M7).
 - Transport has no dtmf/mark events yet — Vobiz doesn't surface them in the

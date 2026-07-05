@@ -1,12 +1,17 @@
 """
-session.py — The brain of a single call.
+session.py — Per-call wiring: transport + providers + Turn Engine.
 
-Carrier-free since M3: the session pumps TransportEvents from a Transport
-and speaks back through play/clear/checkpoint. It never sees wire JSON,
-base64, or frame pacing — those belong to the transport adapter.
+Since M4 the session makes no turn-taking decisions. It normalizes raw
+signals into engine events (speech verdicts, transcripts, timer firings,
+playback progress), executes the intents the engine returns (greeting,
+commit, cancel, timers), and runs the LLM→clauses→TTS→transport reply
+pipeline. All the *rules* — barge-in thresholds, greeting policy,
+endpointing, staleness — live in runtime/turn_engine.py where they are
+pure and replay-testable.
 """
 from __future__ import annotations
 import asyncio
+import contextlib
 import logging
 
 import webrtcvad
@@ -15,15 +20,24 @@ import audio
 import booking
 import config
 from runtime.clauses import stream_clauses
+from runtime.endpointing import Endpointer, FixedSilenceEndpointer, ProviderEndpointer
 from runtime.interfaces import LLM, TTS, STTFactory, Transport
 from runtime.markers import extract_actions
+from runtime.turn_engine import (
+    ArmEndpointTimer,
+    CancelOutput,
+    CommitUserTurn,
+    Intent,
+    PlayGreeting,
+    TurnEngine,
+    TurnPolicy,
+)
 from runtime.types import (
     MULAW_8K,
     AudioFrame,
     CallEnded,
     CallStarted,
     MediaReceived,
-    OutputCleared,
     PlaybackFinished,
     STTEvent,
     TransportEvent,
@@ -34,7 +48,8 @@ log = logging.getLogger("session")
 
 class CallSession:
     def __init__(self, transport: Transport, *,
-                 stt_factory: STTFactory, tts: TTS, llm: LLM):
+                 stt_factory: STTFactory, tts: TTS, llm: LLM,
+                 engine: TurnEngine | None = None):
         self._transport = transport
         self.stream_id: str | None = None
         self.call_id: str | None = None
@@ -45,16 +60,28 @@ class CallSession:
         self.stt = stt_factory(self._on_stt_event)
         self.tts = tts
         self._llm = llm
+        self._engine = engine if engine is not None else TurnEngine(
+            policy=TurnPolicy(
+                bargein_min_frames=config.BARGEIN_MIN_FRAMES,
+                partial_interrupt_after_s=0.5,
+                filler=config.THINKING_FILLER,
+            ),
+            endpointer=self._pick_endpointer(),
+        )
 
-        self._pending_user = ""
         self._endpoint_timer: asyncio.Task | None = None
         self._speak_task: asyncio.Task | None = None
-        self._is_speaking = False
-        self._speak_ended_at: float = 0
-        self._turn_seq = 0
-        self._bargein_run = 0
-        self._greeting_active: bool = False
         self._vad = webrtcvad.Vad(config.VAD_AGGRESSIVENESS)
+
+    def _pick_endpointer(self) -> Endpointer:
+        delay_s = config.ENDPOINT_SILENCE_MS / 1000
+        if config.ENDPOINTER == "provider" and self.stt.emits_endpoint:
+            return ProviderEndpointer(fallback_delay_s=delay_s)
+        return FixedSilenceEndpointer(delay_s=delay_s)
+
+    @staticmethod
+    def _now() -> float:
+        return asyncio.get_event_loop().time()
 
     # ---------------------------------------------------------------- events
     async def run(self) -> None:
@@ -72,8 +99,10 @@ class CallSession:
             await self._on_start(ev)
         elif isinstance(ev, MediaReceived):
             await self._on_media(ev.frame)
-        elif isinstance(ev, (PlaybackFinished, OutputCleared)):
-            self._is_speaking = False
+        elif isinstance(ev, PlaybackFinished):
+            await self._execute(self._engine.playback_finished())
+        # OutputCleared: the engine already left AGENT_SPEAKING when it
+        # emitted CancelOutput; the carrier ack carries no new information.
 
     async def _on_start(self, ev: CallStarted) -> None:
         self.stream_id = ev.stream_id
@@ -81,86 +110,98 @@ class CallSession:
         self.caller_number = ev.caller
         log.info("Call start stream=%s call=%s", self.stream_id, self.call_id)
         await self.stt.start()
-        self.messages.append({"role": "assistant", "content": config.GREETING})
-        self._greeting_active = True
-        self._speak_task = asyncio.create_task(self._speak_greeting())
-
-    async def _speak_greeting(self) -> None:
-        try:
-            await self._speak(config.GREETING)
-        finally:
-            self._greeting_active = False
+        await self._execute(self._engine.call_started())
 
     async def _on_media(self, frame: AudioFrame) -> None:
         # Always forward audio to STT — the recognizer needs a continuous stream.
         await self.stt.send_audio(frame)
 
-        if self._is_speaking or self._greeting_active:
-            return
-
-        # Barge-in: requires sustained RMS *and* VAD confirmation
+        # Normalize the frame to a speech verdict; the engine owns what the
+        # verdict *means* (barge-in counting, greeting immunity).
         pcm = audio.ulaw_to_pcm16(frame.payload)
         rms_high = audio.rms(pcm) > config.BARGEIN_RMS_THRESHOLD
-
         # 20 ms frame at 8 kHz = 160 samples = 320 bytes — valid webrtcvad size
         try:
-            is_speech = self._vad.is_speech(pcm.tobytes(), 8000)
+            vad_speech = self._vad.is_speech(pcm.tobytes(), 8000)
         except Exception:
-            is_speech = False
+            vad_speech = False
+        await self._execute(self._engine.media_frame(rms_high and vad_speech))
 
-        if rms_high and is_speech:
-            self._bargein_run += 1
-            if self._bargein_run >= config.BARGEIN_MIN_FRAMES:
-                await self._interrupt()
-        else:
-            self._bargein_run = 0
-
-    # ---------------------------------------------------------------- STT cb
     async def _on_stt_event(self, ev: STTEvent) -> None:
         if ev.kind == "partial":
-            await self._on_partial(ev.text)
+            await self._execute(self._engine.stt_partial(self._now()))
         elif ev.kind == "final":
-            await self._on_final(ev.text)
+            log.info("STT FINAL: %s", ev.text)
+            await self._execute(self._engine.stt_final(ev.text))
+        elif ev.kind == "endpoint":
+            await self._execute(self._engine.stt_endpoint())
 
-    async def _on_partial(self, text: str) -> None:
-        if self._is_speaking:
-            loop_time = asyncio.get_event_loop().time()
-            if (loop_time - self._speak_ended_at) > 0.5:
-                await self._interrupt()
+    # ------------------------------------------------------------- intents
+    async def _execute(self, intents: list[Intent]) -> None:
+        for intent in intents:
+            if isinstance(intent, PlayGreeting):
+                self.messages.append({"role": "assistant", "content": config.GREETING})
+                self._speak_task = asyncio.create_task(self._speak_greeting())
+            elif isinstance(intent, ArmEndpointTimer):
+                if self._endpoint_timer and not self._endpoint_timer.done():
+                    self._endpoint_timer.cancel()
+                self._endpoint_timer = asyncio.create_task(
+                    self._fire_endpoint(intent.generation, intent.delay_s))
+            elif isinstance(intent, CancelOutput):
+                await self._cancel_output(intent.turn_seq)
+            elif isinstance(intent, CommitUserTurn):
+                log.info("USER: %s", intent.text)
+                self.messages.append({"role": "user", "content": intent.text})
+                self._speak_task = asyncio.create_task(
+                    self._generate_and_speak(intent.turn_seq, intent.play_filler))
 
-    async def _on_final(self, text: str) -> None:
-        log.info("STT FINAL: %s", text)
-        self._pending_user = (self._pending_user + " " + text).strip()
-        if self._endpoint_timer and not self._endpoint_timer.done():
-            self._endpoint_timer.cancel()
-        self._endpoint_timer = asyncio.create_task(self._endpoint_after_silence())
-
-    async def _endpoint_after_silence(self) -> None:
+    async def _fire_endpoint(self, generation: int, delay_s: float) -> None:
         try:
-            await asyncio.sleep(config.ENDPOINT_SILENCE_MS / 1000)
+            await asyncio.sleep(delay_s)
         except asyncio.CancelledError:
             return
-        user_text = self._pending_user.strip()
-        self._pending_user = ""
-        if user_text:
-            await self._respond_to(user_text)
+        await self._execute(self._engine.endpoint_fired(generation))
 
-    # ------------------------------------------------------------ responding
-    async def _respond_to(self, user_text: str) -> None:
-        log.info("USER: %s", user_text)
-        self.messages.append({"role": "user", "content": user_text})
-        self._turn_seq += 1
-        seq = self._turn_seq
-        self._speak_task = asyncio.create_task(self._generate_and_speak(seq))
+    async def _cancel_output(self, turn_seq: int) -> None:
+        task = self._speak_task
+        if task and not task.done():
+            task.cancel()
+            # Wait for the pipeline to unwind so its history append (spoken
+            # clauses only, D4) lands *before* any new turn's user message.
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        await self._transport.clear()
+        log.info("Cancelled output for turn %s", turn_seq)
 
-    async def _generate_and_speak(self, seq: int) -> None:
-        full_reply = ""
+    # ------------------------------------------------------------ pipeline
+    async def _speak_greeting(self) -> None:
+        frames = 0
         try:
-            async for chunk in stream_clauses(self._llm.stream(self.messages)):
-                if seq != self._turn_seq:
+            frames = await self._speak(config.GREETING, 0)
+        finally:
+            await self._execute(
+                self._engine.speaking_finished(0, any_audio=frames > 0))
+
+    async def _generate_and_speak(self, seq: int, play_filler: bool) -> None:
+        spoken: list[str] = []
+        frames = 0
+        gen = stream_clauses(self._llm.stream(self.messages))
+
+        async def _next_clause() -> str | None:
+            return await anext(gen, None)
+
+        # Start pulling the first clause *before* the filler plays, so the
+        # filler genuinely masks LLM time-to-first-token instead of adding
+        # to it.
+        first_task = asyncio.create_task(_next_clause())
+        try:
+            if play_filler:
+                frames += await self._speak(config.THINKING_FILLER, seq)
+            chunk = await first_task
+            while chunk is not None:
+                if self._engine.is_stale(seq):
                     return
                 clean, bk, brochure = extract_actions(chunk)
-                full_reply += " " + clean
                 if bk:
                     asyncio.create_task(
                         booking.save_booking(
@@ -170,21 +211,27 @@ class CallSession:
                         booking.send_brochure(self.caller_number))
                 if clean:
                     log.info("LLM chunk: %s", clean)
-                    await self._speak(clean)
+                    frames += await self._speak(clean, seq)
+                    # D4: history records what the caller actually heard —
+                    # a clause counts only once fully played out.
+                    spoken.append(clean)
+                chunk = await _next_clause()
         except asyncio.CancelledError:
             log.info("Reply turn %s cancelled (barge-in)", seq)
             raise
         finally:
-            if full_reply.strip():
-                self.messages.append(
-                    {"role": "assistant", "content": full_reply.strip()})
-                log.info("PRIYA: %s", full_reply.strip())
+            first_task.cancel()
+            if spoken:
+                reply = " ".join(spoken)
+                self.messages.append({"role": "assistant", "content": reply})
+                log.info("PRIYA: %s", reply)
+            await self._execute(
+                self._engine.speaking_finished(seq, any_audio=frames > 0))
 
-    async def _speak(self, text: str) -> None:
+    async def _speak(self, text: str, seq: int) -> int:
+        """Synthesize and play one utterance; returns frames actually sent."""
         log.info("SPEAK called: %s", text[:60])
-        self._is_speaking = True
-        self._speak_ended_at = asyncio.get_event_loop().time()
-        self._bargein_run = 0
+        await self._execute(self._engine.speaking_started(seq, self._now()))
         frame_count = 0
         try:
             async for frame in self.tts.synthesize(text, MULAW_8K):
@@ -192,23 +239,12 @@ class CallSession:
                 await self._transport.play(frame)
             log.info("SPEAK done: %d frames sent", frame_count)
             # The transport no-ops this before the call starts.
-            await self._transport.checkpoint(f"turn-{self._turn_seq}")
+            await self._transport.checkpoint(f"turn-{seq}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             log.error("speak error: %s", e)
-        finally:
-            self._is_speaking = False
-            self._speak_ended_at = asyncio.get_event_loop().time()
-
-    async def _interrupt(self) -> None:
-        self._bargein_run = 0
-        self._is_speaking = False
-        self._speak_ended_at = asyncio.get_event_loop().time()
-        await self._transport.clear()
-        if self._speak_task and not self._speak_task.done():
-            self._speak_task.cancel()
-        log.info("Barge-in: cleared audio")
+        return frame_count
 
     # --------------------------------------------------------------- teardown
     async def cleanup(self) -> None:

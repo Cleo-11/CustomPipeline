@@ -81,6 +81,7 @@ class DeepgramSTT:
 
                 elif msg_type == "UtteranceEnd":
                     log.debug("Utterance end received")
+                    await self._on_event(STTEvent(kind="endpoint", text=""))
 
         except asyncio.CancelledError:
             pass

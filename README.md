@@ -41,18 +41,18 @@ synthesised. That pipelining is what gets you a human-feeling response time.
 
 | Stage | Typical | Lever (in `config.py`) |
 |-------|---------|------------------------|
-| Endpointing (silence after speech) | 400–550 ms | `ENDPOINT_SILENCE_MS` (Deepgram endpoint events arrive but aren't used yet) |
+| Endpointing (silence after speech) | 400–550 ms | `ENDPOINT_SILENCE_MS`; or set `ENDPOINTER=provider` to trust Deepgram's UtteranceEnd events (silence window stays as fallback) |
 | STT final transcript | ~100–200 ms | streaming, runs continuously |
 | LLM time-to-first-token | 150–400 ms | warm Ollama (`keep_alive`), short prompt, GPU |
 | First clause → TTS first byte | 150–300 ms | clause chunking |
 | **Perceived total** | **~0.7–1.0 s** | |
 
-One cheap trick already wired in, one pending:
-- **Clause chunking** (`llm.stream_sentences`): the first clause is flushed to
+Two cheap tricks wired in:
+- **Clause chunking** (`runtime/clauses.py`): the first clause is flushed to
   TTS early, so audio begins long before the full reply.
-- **Thinking filler** (`THINKING_FILLER`): reserved config for masking LLM
-  startup with a tiny "हम्म" — **not wired up yet**; lands with the Turn
-  Engine milestone (ROADMAP.md M4).
+- **Thinking filler** (`THINKING_FILLER`): the instant the caller's turn
+  commits, a tiny "हम्म" plays while the LLM's first tokens are still in
+  flight. Set to `""` to disable.
 
 ---
 
@@ -135,7 +135,9 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | File | Role |
 |------|------|
 | `server.py` | FastAPI: Vobiz webhooks + `/ws` socket + composition root wiring providers/transport |
-| `session.py` | Per-call orchestrator: turn-taking, barge-in, pipelining (vendor- and carrier-free) |
+| `session.py` | Per-call wiring: engine events in, engine intents out, LLM→TTS reply pipeline |
+| `runtime/turn_engine.py` | The turn-taking state machine — pure, I/O-free, replay-testable |
+| `runtime/endpointing.py` | Pluggable end-of-turn strategies (fixed silence / provider-trusting) |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
 | `transports/vobiz.py` | Vobiz WS adapter: event normalization, single-writer sends, deadline frame pacing |
 | `transports/local.py` | In-memory scripted transport for tests/replay |
@@ -156,7 +158,7 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 |--------|-----|
 | Agent talks over the caller | lower `BARGEIN_MIN_FRAMES` / `BARGEIN_RMS_THRESHOLD` |
 | Agent cuts caller off too early | raise `ENDPOINT_SILENCE_MS` (e.g. 700) |
-| Long pause before agent replies | warm Ollama, shorten KB, enable `THINKING_FILLER`, move to vLLM/GPU |
+| Long pause before agent replies | warm Ollama, shorten KB, keep `THINKING_FILLER` on, move to vLLM/GPU |
 | Robotic / metallic voice | confirm 24k→8k path; don't double-resample |
 | Empty transcripts | check `DEEPGRAM_API_KEY` and the Deepgram console logs |
 | Mispronounced Hindi | ensure model outputs Devanagari (see prompt) |

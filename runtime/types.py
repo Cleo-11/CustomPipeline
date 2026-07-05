@@ -35,11 +35,12 @@ class AudioFrame:
 class STTEvent:
     """Normalized recognizer event.
 
-    Endpoint/speech-boundary kinds arrive with the Turn Engine (M4), which
-    is what will consume them; today's session only reacts to transcripts.
+    "endpoint" = the provider believes the utterance is over (Deepgram
+    UtteranceEnd). Only consulted when the Turn Engine's endpointer is
+    provider-trusting; text is empty for this kind.
     """
 
-    kind: Literal["partial", "final"]
+    kind: Literal["partial", "final", "endpoint"]
     text: str
 
 
