@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import booking
 import config
 from runtime import agent_registry, events
 from runtime.events import EventBus
+from runtime.tools import MarkerToolStrategy, ToolExecutor
 from runtime.types import CallEnded, PlaybackFinished, STTEvent
 from session import CallSession
 from test_session_scripted import (
@@ -21,6 +21,7 @@ from test_session_scripted import (
     FakeSTT,
     FakeTTS,
     GatedTTS,
+    fake_tool_registry,
     media,
 )
 from transports.local import LocalTransport
@@ -42,7 +43,7 @@ class Recorder:
 
 @pytest.fixture
 def rig(monkeypatch):
-    def make(*, filler="", tts=None):
+    def make(*, filler="", tts=None, tool_registry=None):
         monkeypatch.setattr(config, "ENDPOINT_SILENCE_MS", 20)
         monkeypatch.setattr(config, "BARGEIN_MIN_FRAMES", 3)
         monkeypatch.setattr(config, "THINKING_FILLER", filler)
@@ -51,8 +52,13 @@ def rig(monkeypatch):
         bus = EventBus()
         rec = Recorder()
         bus.subscribe(rec)
+        strategy = executor = None
+        if tool_registry is not None:
+            strategy = MarkerToolStrategy(tool_registry.resolve(list(agent.tools)))
+            executor = ToolExecutor(tool_registry, bus)
         s = CallSession(transport, agent=agent, stt_factory=FakeSTT,
-                        tts=tts or FakeTTS(), llm=FakeLLM(), bus=bus)
+                        tts=tts or FakeTTS(), llm=FakeLLM(), bus=bus,
+                        tool_strategy=strategy, tool_executor=executor)
         s._vad = SimpleNamespace(is_speech=lambda pcm_bytes, rate: True)
         s.transport = transport
         return s, bus, rec
@@ -151,31 +157,28 @@ async def test_superseding_turn_marks_first_turn_interrupted(rig):
     assert len(rec.only(events.AgentInterrupted)) == 1
 
 
-async def test_tool_audit_events(rig, monkeypatch):
-    sess, bus, rec = rig()
+async def test_tool_audit_events(rig):
+    async def fake_book(ctx, args):
+        return None
+
+    async def fake_brochure(ctx, args):
+        raise RuntimeError("whatsapp api down")
+
+    sess, bus, rec = rig(tool_registry=fake_tool_registry(fake_book, fake_brochure))
     sess._llm.replies = [
         ["ठीक है। [[BOOK day=Sunday time=4pm name=Rahul]] [[BROCHURE]]"]
     ]
-
-    async def fake_save(call_id, caller, bk):
-        return None
-
-    async def fake_brochure(number):
-        raise RuntimeError("whatsapp api down")
-
-    monkeypatch.setattr(booking, "save_booking", fake_save)
-    monkeypatch.setattr(booking, "send_brochure", fake_brochure)
 
     await sess._dispatch(START)
     await sess._speak_task
     await sess._dispatch(PlaybackFinished())
     await _user_turn(sess, "Sunday aaunga")
-    await asyncio.sleep(0)  # let the fire-and-forget tool tasks run
+    await asyncio.sleep(0.05)  # let the executor's fire-and-forget tasks run
     await bus.flush()
 
     assert {e.tool for e in rec.only(events.ToolCalled)} == {
-        "save_booking", "send_brochure"}
-    assert [e.tool for e in rec.only(events.ToolSucceeded)] == ["save_booking"]
+        "book_site_visit", "send_brochure"}
+    assert [e.tool for e in rec.only(events.ToolSucceeded)] == ["book_site_visit"]
     failed = rec.only(events.ToolFailed)
     assert [(e.tool, e.error) for e in failed] == [
         ("send_brochure", "whatsapp api down")]

@@ -44,12 +44,15 @@ class STTPolicy:
 @dataclass(frozen=True)
 class LLMPolicy:
     """Inference policy. `base_url` selects the OpenAI-compatible server;
-    the api key is injected at the composition root, never stored here."""
+    the api key is injected at the composition root, never stored here.
+    `tool_dispatch` picks the tool strategy: "marker" (default — reliable
+    with small models) or "native" (OpenAI-protocol tool calls)."""
 
     base_url: str
     model: str
     temperature: float
     max_tokens: int
+    tool_dispatch: str
 
 
 @dataclass(frozen=True)
@@ -88,8 +91,13 @@ class AgentConfig:
     stt: STTPolicy
     llm: LLMPolicy
     turn: TurnSettings
-    # tools: list[ToolSpec] arrives with the tool registry (M7). Until then
-    # the [[BOOK]]/[[BROCHURE]] markers in system_prompt are the mechanism.
+    # Names of registered tools this agent may call (M7). The composition
+    # root resolves them against the ToolRegistry; the record stays pure
+    # data — no handlers, no imports.
+    tools: tuple[str, ...]
+    # Freeform per-agent tool configuration (e.g. brochure URL), passed to
+    # handlers via ToolContext.agent. Business config, not runtime config.
+    tool_config: dict[str, Any]
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], defaults: dict[str, Any]) -> AgentConfig:
@@ -110,4 +118,6 @@ class AgentConfig:
             stt=STTPolicy(**section("stt")),
             llm=LLMPolicy(**section("llm")),
             turn=TurnSettings(**section("turn")),
+            tools=tuple(data.get("tools", ())),
+            tool_config=dict(data.get("tool_config", {})),
         )

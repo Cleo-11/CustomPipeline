@@ -6,11 +6,15 @@ never a code change.
 """
 from __future__ import annotations
 
+import json
+import logging
 from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
-from runtime.types import LLMDelta
+from runtime.types import LLMDelta, ToolCallRequest
+
+log = logging.getLogger("providers.llm.openai_compat")
 
 
 class OpenAICompatLLM:
@@ -46,15 +50,54 @@ class OpenAICompatLLM:
         except Exception:  # noqa: BLE001
             return False
 
-    async def stream(self, messages: list[Any]) -> AsyncIterator[LLMDelta]:
-        stream = await self._client.chat.completions.create(
+    async def stream(self, messages: list[Any],
+                     tools: list[dict] | None = None) -> AsyncIterator[LLMDelta]:
+        kwargs: dict[str, Any] = dict(
             model=self._model,
             messages=messages,
             temperature=self._temperature,
             stream=True,
             max_tokens=self._max_tokens,
         )
+        if tools:
+            kwargs["tools"] = tools
+        stream = await self._client.chat.completions.create(**kwargs)
+
+        # Native tool calls arrive as fragments (index-correlated name +
+        # argument-JSON pieces). Accumulate here and yield each call as ONE
+        # assembled delta at stream end — the runtime never sees fragments.
+        pending: dict[int, dict[str, str]] = {}
         async for part in stream:
-            delta = part.choices[0].delta.content if part.choices else None
-            if delta:
-                yield LLMDelta(text=delta)
+            if not part.choices:
+                continue
+            delta = part.choices[0].delta
+            for tc in getattr(delta, "tool_calls", None) or []:
+                slot = pending.setdefault(tc.index, {"name": "", "args": ""})
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] = fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["args"] += fn.arguments
+            if delta.content:
+                yield LLMDelta(text=delta.content)
+        for slot in pending.values():
+            request = _assemble_tool_call(slot["name"], slot["args"])
+            if request is not None:
+                yield LLMDelta(tool_call=request)
+
+
+def _assemble_tool_call(name: str, args_json: str) -> ToolCallRequest | None:
+    """Parse an accumulated tool call; malformed output from small models
+    is dropped with a log — the marker strategy exists for exactly them."""
+    if not name:
+        return None
+    try:
+        args = json.loads(args_json) if args_json.strip() else {}
+    except ValueError:
+        log.warning("Malformed tool-call arguments for %s: %r", name, args_json)
+        return None
+    if not isinstance(args, dict):
+        log.warning("Tool-call arguments for %s not an object: %r", name, args)
+        return None
+    return ToolCallRequest(name=name, args=args)

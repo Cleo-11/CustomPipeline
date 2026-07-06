@@ -26,7 +26,8 @@ class _Probe:
 def _fake_providers(monkeypatch, *, llm=True, tts=True, stt=True):
     fake = server._Providers(
         stt_factory=lambda on_event: _Probe(stt),
-        tts=_Probe(tts), llm=_Probe(llm))
+        tts=_Probe(tts), llm=_Probe(llm),
+        tool_strategy=server.MarkerToolStrategy(()))
     monkeypatch.setattr(server, "_build_providers", lambda agent: fake)
 
 

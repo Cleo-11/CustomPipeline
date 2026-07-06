@@ -9,5 +9,12 @@
     "speaker": "ishita",
     "language": "hi-IN",
     "pace": 1.05
+  },
+  "tools": ["book_site_visit", "send_brochure"],
+  "tool_config": {
+    "bookings_path": "bookings.jsonl",
+    "brochure_url": "https://your-cdn.example.com/northern-heights-brochure.pdf",
+    "brochure_filename": "Northern-Heights-Brochure.pdf",
+    "brochure_caption": "Northern Heights, Dahisar East — N Rose Developers"
   }
 }

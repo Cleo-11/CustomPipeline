@@ -45,10 +45,22 @@ class STTEvent:
 
 
 @dataclass(frozen=True)
-class LLMDelta:
-    """One increment of a streamed model reply. Tool-call deltas land in M7."""
+class ToolCallRequest:
+    """A fully-assembled native tool call from the model. Adapters
+    accumulate the provider's streaming fragments and emit one of these;
+    the runtime never sees half a tool call."""
 
-    text: str
+    name: str
+    args: dict
+
+
+@dataclass(frozen=True)
+class LLMDelta:
+    """One increment of a streamed model reply: text, or (since M7) a
+    complete native tool-call request."""
+
+    text: str = ""
+    tool_call: ToolCallRequest | None = None
 
 
 # ---------------------------------------------------------------------------

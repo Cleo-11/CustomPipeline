@@ -1,25 +1,40 @@
-"""runtime/markers.py — [[BOOK ...]] / [[BROCHURE]] marker parsing.
+"""runtime/markers.py — [[MARKER k=v ...]] token parsing.
 
-Interim home: markers are the current tool-dispatch mechanism — the model
-appends them to replies and the session strips them before TTS. The tool
-registry (M7) demotes this to one dispatch strategy among several and
-moves it behind that interface.
+Since M7 this is the text-level half of the *marker dispatch strategy*
+(runtime/tools.py): tools declare a marker token in their ToolSpec, the
+model appends `[[TOKEN key=value ...]]` to replies, and this module strips
+recognized tokens out of the spoken text and returns them as tool calls.
+
+Markers a call's agent doesn't own are left in the text untouched — the
+parser only speaks for the tools it was given.
 """
 from __future__ import annotations
 
 import re
+from typing import Mapping
 
-_BOOK_RE = re.compile(r"\[\[BOOK([^\]]*)\]\]", re.IGNORECASE)
-_BROCHURE_RE = re.compile(r"\[\[BROCHURE\]\]", re.IGNORECASE)
+_MARKER_RE = re.compile(r"\[\[(\w+)([^\]]*)\]\]")
 _KV_RE = re.compile(r"(\w+)\s*=\s*([^=\]]+?)(?=\s+\w+=|$)")
 
 
-def extract_actions(text: str) -> tuple[str, dict | None, bool]:
-    """Return (clean_spoken_text, booking_dict_or_None, brochure_requested)."""
-    booking = None
-    m = _BOOK_RE.search(text)
-    if m:
-        booking = {k.lower(): v.strip() for k, v in _KV_RE.findall(m.group(1))}
-    brochure = bool(_BROCHURE_RE.search(text))
-    clean = _BROCHURE_RE.sub("", _BOOK_RE.sub("", text)).strip()
-    return clean, booking, brochure
+def extract_tool_calls(
+    text: str, markers: Mapping[str, str]
+) -> tuple[str, list[tuple[str, dict]]]:
+    """Parse recognized markers out of `text`.
+
+    `markers` maps an UPPERCASE marker token to the tool name it triggers.
+    Returns (clean_spoken_text, [(tool_name, args), ...]) — args are the
+    marker's k=v pairs, lowercased keys, {} for bare markers.
+    """
+    calls: list[tuple[str, dict]] = []
+
+    def _consume(m: re.Match[str]) -> str:
+        tool = markers.get(m.group(1).upper())
+        if tool is None:
+            return m.group(0)  # not ours: leave it in the text
+        args = {k.lower(): v.strip() for k, v in _KV_RE.findall(m.group(2))}
+        calls.append((tool, args))
+        return ""
+
+    clean = _MARKER_RE.sub(_consume, text).strip()
+    return clean, calls

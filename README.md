@@ -143,6 +143,8 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `runtime/events.py` | Typed conversation events + the non-blocking in-process event bus |
 | `runtime/metrics.py` | Latency/counter registry, Prometheus text exposition, turn-metrics subscriber |
 | `runtime/sinks.py` | Bus subscribers: structured event log, transcript JSONL, JSON log formatter |
+| `runtime/tools.py` | Tool registry + executor (timeout/retry/audit events) + marker/native dispatch strategies |
+| `agents/priya_tools.py` | Priya's business tools: site-visit booking, WhatsApp brochure (was `booking.py`) |
 | `agents/priya.json` | Priya/Northern Heights — the reference agent, as data |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
 | `transports/vobiz.py` | Vobiz WS adapter: event normalization, single-writer sends, deadline frame pacing |
@@ -151,7 +153,6 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `providers/tts/sarvam.py` | Sarvam Bulbul v3 REST TTS adapter → mu-law frames |
 | `providers/llm/openai_compat.py` | Adapter for any OpenAI-compatible LLM endpoint |
 | `audio.py` | G.711 mu-law codec + resampling (unit-tested) |
-| `booking.py` | Appointment store + WhatsApp brochure via Vobiz |
 | `config.py` | Deployment engine defaults + credentials (no longer the agent) |
 | `make_call.py` | Outbound dialer |
 | `tests/` | Characterization tests: audio codec, clause chunking, scripted call flows, route auth |
@@ -176,9 +177,33 @@ nothing on the audio path ever waits for an observer.
 - **`transcripts.jsonl`** — per-call lifecycle + per-turn records (what was
   actually spoken, with latencies), appended by a subscriber off the loop.
 - **`LOG_FORMAT=json`** — one JSON object per log line for prod pipelines.
-- Booking/brochure calls now run through the session's tool runner:
-  `ToolCalled/ToolSucceeded/ToolFailed` audit events, file I/O off the
+- Booking/brochure run through the tool executor: `ToolCalled/ToolSucceeded/
+  ToolFailed` audit events, per-tool timeout + retry, file I/O off the
   event loop.
+
+---
+
+## Tools (M7)
+
+Tools are registered capabilities (`runtime/tools.py`); the runtime
+executes them without knowing the business logic. Priya's tools —
+`book_site_visit` and `send_brochure` — live in `agents/priya_tools.py`
+and are listed by name in `agents/priya.json`, alongside her `tool_config`
+(bookings path, brochure URL — **still a placeholder URL; set a real PDF
+link before relying on brochure delivery**).
+
+Two dispatch strategies, chosen per agent via `LLM_TOOL_DISPATCH` (or the
+agent's `llm.tool_dispatch`):
+
+- **`marker`** (default): the model appends `[[BOOK day=… time=… name=…]]`
+  / `[[BROCHURE]]` to its reply; the runtime strips and dispatches them.
+  Reliable with small Hinglish-capable models.
+- **`native`**: OpenAI-protocol tool calls. The adapter assembles streamed
+  fragments and drops malformed calls — worth enabling on models that do
+  tool-calling well; also removes the split-marker leak limitation.
+
+Tool results are not fed back to the model (fire-and-forget), matching the
+original marker contract.
 
 ---
 

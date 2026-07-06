@@ -68,6 +68,7 @@ def _defaults() -> dict[str, dict[str, Any]]:
             "model": config.LLM_MODEL,
             "temperature": config.LLM_TEMPERATURE,
             "max_tokens": config.LLM_MAX_TOKENS,
+            "tool_dispatch": config.LLM_TOOL_DISPATCH,
         },
         "turn": {
             "endpoint_silence_ms": config.ENDPOINT_SILENCE_MS,

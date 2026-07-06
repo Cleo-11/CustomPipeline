@@ -51,7 +51,8 @@ def test_from_dict_fills_every_section_from_defaults():
     defaults = {
         "voice": {"model": "m", "speaker": "s", "language": "l", "pace": 1.0},
         "stt": {"model": "nova-2", "language": "hi", "endpointer": "fixed"},
-        "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5, "max_tokens": 128},
+        "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5,
+                "max_tokens": 128, "tool_dispatch": "marker"},
         "turn": {
             "endpoint_silence_ms": 550, "bargein_rms_threshold": 650.0,
             "bargein_min_frames": 25, "vad_aggressiveness": 2,
@@ -66,14 +67,18 @@ def test_from_dict_fills_every_section_from_defaults():
     assert agent.knowledge == ""                 # defaulted
     assert agent.voice.speaker == "s"            # inherited from defaults
     assert agent.llm.max_tokens == 128
+    assert agent.llm.tool_dispatch == "marker"
     assert agent.turn.filler == "हम्म"
+    assert agent.tools == ()                     # toolless by default
+    assert agent.tool_config == {}
 
 
 def test_from_dict_spec_overrides_defaults():
     defaults = {
         "voice": {"model": "m", "speaker": "default-voice", "language": "l", "pace": 1.0},
         "stt": {"model": "nova-2", "language": "hi", "endpointer": "fixed"},
-        "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5, "max_tokens": 128},
+        "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5,
+                "max_tokens": 128, "tool_dispatch": "marker"},
         "turn": {
             "endpoint_silence_ms": 550, "bargein_rms_threshold": 650.0,
             "bargein_min_frames": 25, "vad_aggressiveness": 2,
@@ -83,10 +88,14 @@ def test_from_dict_spec_overrides_defaults():
     spec = {
         "agent_id": "custom", "system_prompt": "p", "greeting": "g",
         "voice": {"speaker": "pinned-voice"},  # partial section: merges over defaults
+        "llm": {"tool_dispatch": "native"},    # per-agent strategy choice
+        "tools": ["book_site_visit"],
     }
     agent = AgentConfig.from_dict(spec, defaults)
     assert agent.voice.speaker == "pinned-voice"
     assert agent.voice.model == "m"  # the unpinned field still inherits
+    assert agent.llm.tool_dispatch == "native"
+    assert agent.tools == ("book_site_visit",)
 
 
 def test_engine_policy_projection():

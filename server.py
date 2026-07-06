@@ -31,6 +31,7 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import PlainTextResponse, Response
 
 import config
+from agents import priya_tools
 from providers.llm.openai_compat import OpenAICompatLLM
 from providers.stt.deepgram import DeepgramSTT
 from providers.tts.sarvam import SarvamTTS
@@ -40,6 +41,13 @@ from runtime.events import EventBus
 from runtime.interfaces import LLM, TTS, OnSTTEvent, STTFactory, SupportsHealth
 from runtime.metrics import MetricsRegistry, TurnMetrics
 from runtime.sinks import EventLogSubscriber, JsonFormatter, TranscriptWriter
+from runtime.tools import (
+    MarkerToolStrategy,
+    NativeToolStrategy,
+    ToolDispatchStrategy,
+    ToolExecutor,
+    ToolRegistry,
+)
 from runtime.types import STTEvent
 from session import CallSession
 from transports.vobiz import VobizTransport
@@ -66,6 +74,14 @@ BUS.subscribe(EventLogSubscriber())
 BUS.subscribe(TurnMetrics(METRICS))
 BUS.subscribe(TranscriptWriter(config.TRANSCRIPTS_PATH))
 
+# Tool wiring (M7): agents' tool modules register their specs here; agents
+# reference tools by name in their records. Dynamic loading of tool modules
+# from agent specs is the P3 plugin SDK — until then registration is an
+# explicit line at this composition root.
+TOOL_REGISTRY = ToolRegistry()
+priya_tools.register(TOOL_REGISTRY)
+TOOL_EXECUTOR = ToolExecutor(TOOL_REGISTRY, BUS)
+
 
 # ---------------------------------------------------------------------------
 # Composition root — the only place vendor names, agent policy, and secrets
@@ -77,6 +93,7 @@ class _Providers:
     stt_factory: STTFactory
     tts: TTS
     llm: LLM
+    tool_strategy: ToolDispatchStrategy
 
 
 # One provider set per agent, built lazily and reused across that agent's
@@ -112,7 +129,17 @@ def _build_providers(agent: AgentConfig) -> _Providers:
             language=agent.stt.language,
         )
 
-    providers = _Providers(stt_factory=stt_factory, tts=tts, llm=llm)
+    # Per-agent tool dispatch: the agent's tool names resolve to specs, and
+    # its llm.tool_dispatch policy picks the strategy.
+    specs = TOOL_REGISTRY.resolve(agent.tools)
+    strategy: ToolDispatchStrategy
+    if agent.llm.tool_dispatch == "native":
+        strategy = NativeToolStrategy(specs)
+    else:
+        strategy = MarkerToolStrategy(specs)
+
+    providers = _Providers(stt_factory=stt_factory, tts=tts, llm=llm,
+                           tool_strategy=strategy)
     _provider_cache[agent.agent_id] = providers
     return providers
 
@@ -216,6 +243,7 @@ async def ws(websocket: WebSocket):
         transport, agent=agent,
         stt_factory=providers.stt_factory, tts=providers.tts, llm=providers.llm,
         bus=BUS,
+        tool_strategy=providers.tool_strategy, tool_executor=TOOL_EXECUTOR,
     )
     try:
         await session.run()

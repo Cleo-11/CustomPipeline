@@ -48,6 +48,10 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "ollama")          # ignored by Ollama
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2:7b")
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "160"))
+# How agents dispatch tools by default: "marker" ([[TOKEN k=v]] in the
+# reply text — reliable with small models) or "native" (OpenAI-protocol
+# tool calls). An agent can pin its own in its llm section.
+LLM_TOOL_DISPATCH = os.getenv("LLM_TOOL_DISPATCH", "marker")
 
 # Default STT model/language for agents that don't pin their own. The rest
 # of the Deepgram connection string is fixed in providers/stt/deepgram.py.

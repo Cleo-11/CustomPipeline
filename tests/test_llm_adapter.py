@@ -2,11 +2,19 @@
 from types import SimpleNamespace
 
 from providers.llm.openai_compat import OpenAICompatLLM
-from runtime.types import LLMDelta
+from runtime.types import LLMDelta, ToolCallRequest
 
 
 def _chunk(content):
     return SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=content))])
+
+
+def _tc_chunk(index, name=None, arguments=""):
+    """One streamed tool-call fragment, OpenAI wire shape."""
+    tc = SimpleNamespace(index=index,
+                         function=SimpleNamespace(name=name, arguments=arguments))
+    delta = SimpleNamespace(content=None, tool_calls=[tc])
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)])
 
 
 class FakeStream:
@@ -18,7 +26,9 @@ class FakeStream:
 
     async def __anext__(self):
         if self._parts:
-            return _chunk(self._parts.pop(0))
+            part = self._parts.pop(0)
+            # Strings/None are text deltas; prebuilt chunks pass through.
+            return part if isinstance(part, SimpleNamespace) else _chunk(part)
         raise StopAsyncIteration
 
 
@@ -53,3 +63,48 @@ async def test_none_and_empty_deltas_are_skipped():
     adapter = make_adapter([None, "ठीक", None, ""], {})
     out = [d.text async for d in adapter.stream([])]
     assert out == ["ठीक"]
+
+
+async def test_tools_kwarg_only_sent_when_provided():
+    seen: dict = {}
+    adapter = make_adapter(["ok"], seen)
+    [d async for d in adapter.stream([])]
+    assert "tools" not in seen
+
+    seen.clear()
+    payload = [{"type": "function", "function": {"name": "t"}}]
+    adapter = make_adapter(["ok"], seen)
+    [d async for d in adapter.stream([], tools=payload)]
+    assert seen["tools"] is payload
+
+
+async def test_fragmented_tool_call_is_assembled_and_yielded_once():
+    # Name in the first fragment; argument JSON split across three.
+    adapter = make_adapter([
+        "ठीक है।",
+        _tc_chunk(0, name="book_site_visit", arguments='{"da'),
+        _tc_chunk(0, arguments='y": "Sun'),
+        _tc_chunk(0, arguments='day"}'),
+    ], {})
+
+    out = [d async for d in adapter.stream([], tools=[{}])]
+
+    assert out[0] == LLMDelta(text="ठीक है।")
+    assert out[1:] == [LLMDelta(tool_call=ToolCallRequest(
+        name="book_site_visit", args={"day": "Sunday"}))]
+
+
+async def test_malformed_tool_call_arguments_are_dropped():
+    adapter = make_adapter([
+        "ok",
+        _tc_chunk(0, name="book_site_visit", arguments='{"day": broken'),
+    ], {})
+    out = [d async for d in adapter.stream([], tools=[{}])]
+    # Text still flows; the unparseable call never reaches the runtime.
+    assert out == [LLMDelta(text="ok")]
+
+
+async def test_empty_arguments_become_empty_dict():
+    adapter = make_adapter([_tc_chunk(0, name="send_brochure")], {})
+    out = [d async for d in adapter.stream([], tools=[{}])]
+    assert out == [LLMDelta(tool_call=ToolCallRequest(name="send_brochure", args={}))]

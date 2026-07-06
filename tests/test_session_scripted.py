@@ -13,9 +13,10 @@ import numpy as np
 import pytest
 
 import audio
-import booking
 import config
 from runtime import agent_registry
+from runtime.events import NULL_BUS
+from runtime.tools import MarkerToolStrategy, ToolExecutor, ToolRegistry, ToolSpec
 from runtime.types import (
     MULAW_8K,
     AudioFrame,
@@ -108,7 +109,7 @@ def op_kinds(transport):
     return [op[0] for op in transport.ops]
 
 
-def make_sess(monkeypatch, *, filler="", tts=None):
+def make_sess(monkeypatch, *, filler="", tts=None, tool_registry=None, bus=None):
     # These are engine defaults the Priya agent inherits, so patching config
     # before resolve() flows them into the resolved AgentConfig.
     monkeypatch.setattr(config, "ENDPOINT_SILENCE_MS", 20)
@@ -116,12 +117,31 @@ def make_sess(monkeypatch, *, filler="", tts=None):
     monkeypatch.setattr(config, "THINKING_FILLER", filler)
     agent = agent_registry.resolve()
     transport = LocalTransport()
+    strategy = executor = None
+    if tool_registry is not None:
+        specs = tool_registry.resolve(list(agent.tools))
+        strategy = MarkerToolStrategy(specs)
+        executor = ToolExecutor(tool_registry, bus if bus is not None else NULL_BUS)
     s = CallSession(transport, agent=agent, stt_factory=FakeSTT,
-                    tts=tts or FakeTTS(), llm=FakeLLM())
+                    tts=tts or FakeTTS(), llm=FakeLLM(), bus=bus,
+                    tool_strategy=strategy, tool_executor=executor)
     # Deterministic VAD: always classify audio as speech
     s._vad = SimpleNamespace(is_speech=lambda pcm_bytes, rate: True)
     s.transport = transport
     return s
+
+
+def fake_tool_registry(book_handler, brochure_handler):
+    """Priya-shaped registry with injected handlers — the test seam the
+    old booking-module monkeypatching becomes under the tool registry."""
+    reg = ToolRegistry()
+    reg.register(ToolSpec(
+        name="book_site_visit", description="book", parameters={"type": "object"},
+        handler=book_handler, owner="test", marker="BOOK"))
+    reg.register(ToolSpec(
+        name="send_brochure", description="brochure", parameters={"type": "object"},
+        handler=brochure_handler, owner="test", marker="BROCHURE"))
+    return reg
 
 
 @pytest.fixture
@@ -258,24 +278,24 @@ async def test_filler_masks_thinking_and_stays_out_of_history(monkeypatch):
     assert all(m["content"] != "हम्म" for m in sess.messages)
 
 
-async def test_booking_and_brochure_markers_dispatch(sess, monkeypatch):
+async def test_booking_and_brochure_markers_dispatch(monkeypatch):
+    saved, brochures = [], []
+
+    async def fake_book(ctx, args):
+        saved.append((ctx.call_id, ctx.caller_name, args))
+
+    async def fake_brochure(ctx, args):
+        brochures.append(ctx.caller_number)
+
+    sess = make_sess(monkeypatch,
+                     tool_registry=fake_tool_registry(fake_book, fake_brochure))
     sess._llm.replies = [
         ["ठीक है, book कर देती हूं। [[BOOK day=Sunday time=4pm name=Rahul]] [[BROCHURE]]"]
     ]
-    saved, brochures = [], []
-
-    async def fake_save(call_id, caller, bk):
-        saved.append((call_id, caller, bk))
-
-    async def fake_brochure(number):
-        brochures.append(number)
-
-    monkeypatch.setattr(booking, "save_booking", fake_save)
-    monkeypatch.setattr(booking, "send_brochure", fake_brochure)
 
     await start_call(sess)
     await run_user_turn(sess, "Sunday 4 baje aaunga, Rahul bol raha hoon")
-    await asyncio.sleep(0)  # let the fire-and-forget booking tasks run
+    await asyncio.sleep(0.05)  # let the executor's fire-and-forget tasks run
 
     assert saved == [("c1", "unknown", {"day": "Sunday", "time": "4pm", "name": "Rahul"})]
     assert brochures == ["+911234567890"]

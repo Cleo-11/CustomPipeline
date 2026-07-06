@@ -18,19 +18,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, Coroutine
 
 import webrtcvad
 
 import audio
-import booking
 from runtime import events
 from runtime.agent import AgentConfig
-from runtime.clauses import stream_clauses
 from runtime.endpointing import Endpointer, FixedSilenceEndpointer, ProviderEndpointer
 from runtime.events import NULL_BUS, EventEmitter
 from runtime.interfaces import LLM, TTS, STTFactory, Transport
-from runtime.markers import extract_actions
+from runtime.tools import (
+    MarkerToolStrategy,
+    ToolContext,
+    ToolDispatchStrategy,
+    ToolExecutor,
+)
 from runtime.turn_engine import (
     ArmEndpointTimer,
     CancelOutput,
@@ -58,10 +60,17 @@ class CallSession:
     def __init__(self, transport: Transport, *, agent: AgentConfig,
                  stt_factory: STTFactory, tts: TTS, llm: LLM,
                  engine: TurnEngine | None = None,
-                 bus: EventEmitter | None = None):
+                 bus: EventEmitter | None = None,
+                 tool_strategy: ToolDispatchStrategy | None = None,
+                 tool_executor: ToolExecutor | None = None):
         self._transport = transport
         self.agent = agent
         self._bus: EventEmitter = bus if bus is not None else NULL_BUS
+        # No strategy wired (tests, toolless agents) → a marker strategy
+        # with zero specs: plain clause streaming, nothing dispatched.
+        self._tooling: ToolDispatchStrategy = (
+            tool_strategy if tool_strategy is not None else MarkerToolStrategy(()))
+        self._tool_executor = tool_executor
         self.stream_id: str | None = None
         self.call_id: str | None = None
         self.caller_number: str = "unknown"
@@ -224,11 +233,24 @@ class CallSession:
             await self._execute(
                 self._engine.speaking_finished(0, any_audio=frames > 0))
 
+    def _dispatch_tool(self, name: str, args: dict) -> None:
+        """Route a tool call from the dispatch strategy to the executor.
+        Synchronous — the executor runs the tool in its own task."""
+        if self._tool_executor is None:
+            log.warning("Tool call %r dropped: no executor wired", name)
+            return
+        self._tool_executor.dispatch(name, args, ToolContext(
+            call_id=self._cid(),
+            caller_number=self.caller_number,
+            caller_name=self.caller_name,
+            agent=self.agent,
+        ))
+
     async def _generate_and_speak(self, seq: int, play_filler: bool) -> None:
         spoken: list[str] = []
         frames = 0
         interrupted = False
-        gen = stream_clauses(self._llm.stream(self.messages))
+        gen = self._tooling.clauses(self._llm, self.messages, self._dispatch_tool)
 
         async def _next_clause() -> str | None:
             return await anext(gen, None)
@@ -256,22 +278,13 @@ class CallSession:
                 if self._engine.is_stale(seq):
                     interrupted = True
                     return
-                clean, bk, brochure = extract_actions(chunk)
-                if bk:
-                    asyncio.create_task(self._run_tool(
-                        "save_booking",
-                        booking.save_booking(
-                            self.call_id or "?", self.caller_name, bk)))
-                if brochure:
-                    asyncio.create_task(self._run_tool(
-                        "send_brochure",
-                        booking.send_brochure(self.caller_number)))
-                if clean:
-                    log.info("LLM chunk: %s", clean)
-                    frames += await self._speak(clean, seq)
-                    # D4: history records what the caller actually heard —
-                    # a clause counts only once fully played out.
-                    spoken.append(clean)
+                # The dispatch strategy already stripped tool calls and
+                # routed them; chunks arriving here are pure speech.
+                log.info("LLM chunk: %s", chunk)
+                frames += await self._speak(chunk, seq)
+                # D4: history records what the caller actually heard —
+                # a clause counts only once fully played out.
+                spoken.append(chunk)
                 chunk = await _next_clause()
         except asyncio.CancelledError:
             interrupted = True
@@ -291,20 +304,6 @@ class CallSession:
                 interrupted=interrupted))
             await self._execute(
                 self._engine.speaking_finished(seq, any_audio=frames > 0))
-
-    async def _run_tool(self, name: str, coro: Coroutine[Any, Any, None]) -> None:
-        """Fire-and-forget tool execution with audit events — the seed of
-        the M7 tool executor. Runs as its own task; never blocks the reply
-        pipeline, and a tool crash becomes a ToolFailed fact, not dead air."""
-        self._bus.emit(events.ToolCalled(call_id=self._cid(), tool=name))
-        try:
-            await coro
-        except Exception as e:  # noqa: BLE001
-            log.error("Tool %s failed: %s", name, e)
-            self._bus.emit(events.ToolFailed(
-                call_id=self._cid(), tool=name, error=str(e)))
-        else:
-            self._bus.emit(events.ToolSucceeded(call_id=self._cid(), tool=name))
 
     async def _speak(self, text: str, seq: int) -> int:
         """Synthesize and play one utterance; returns frames actually sent."""

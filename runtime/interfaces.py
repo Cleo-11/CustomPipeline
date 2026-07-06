@@ -11,8 +11,9 @@ Deliberate deviations from RUNTIME_REDESIGN.md §4:
   nothing yet. M6's event bus did not need it either (the session, not
   the STT, emits bus events); the remaining trigger is a second
   concurrent STT.
-- LLM.stream takes plain chat messages; the `tools` parameter arrives with
-  the tool registry (M7).
+- LLM.stream's `tools` parameter (landed with M7's registry) carries
+  OpenAI-format schemas; tool results are not fed back to the model —
+  dispatch stays fire-and-forget, matching the marker protocol's contract.
 - Transport has no dtmf/mark events yet — Vobiz doesn't surface them in the
   current integration; they join TransportEvent when a carrier needs them.
 """
@@ -64,7 +65,12 @@ class TTS(Protocol):
 
 
 class LLM(Protocol):
-    def stream(self, messages: list[Any]) -> AsyncIterator[LLMDelta]: ...
+    def stream(self, messages: list[Any],
+               tools: list[dict] | None = None) -> AsyncIterator[LLMDelta]:
+        """Stream a reply. `tools` (OpenAI function-schema format, set by
+        the native dispatch strategy) may yield assembled tool_call deltas
+        alongside text; adapters that can't do native tool-calls ignore it."""
+        ...
 
 
 class Transport(Protocol):
