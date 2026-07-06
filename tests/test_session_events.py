@@ -1,0 +1,194 @@
+"""M6: the session announces the call as typed events on the bus.
+
+Drives scripted calls (same fakes as test_session_scripted) with a real
+EventBus and asserts the emitted event sequence and latency payloads.
+"""
+import asyncio
+from types import SimpleNamespace
+
+import pytest
+
+import booking
+import config
+from runtime import agent_registry, events
+from runtime.events import EventBus
+from runtime.types import CallEnded, PlaybackFinished, STTEvent
+from session import CallSession
+from test_session_scripted import (
+    LOUD_ULAW,
+    START,
+    FakeLLM,
+    FakeSTT,
+    FakeTTS,
+    GatedTTS,
+    media,
+)
+from transports.local import LocalTransport
+
+
+class Recorder:
+    def __init__(self):
+        self.seen = []
+
+    async def __call__(self, event):
+        self.seen.append(event)
+
+    def kinds(self):
+        return [type(e).__name__ for e in self.seen]
+
+    def only(self, cls):
+        return [e for e in self.seen if isinstance(e, cls)]
+
+
+@pytest.fixture
+def rig(monkeypatch):
+    def make(*, filler="", tts=None):
+        monkeypatch.setattr(config, "ENDPOINT_SILENCE_MS", 20)
+        monkeypatch.setattr(config, "BARGEIN_MIN_FRAMES", 3)
+        monkeypatch.setattr(config, "THINKING_FILLER", filler)
+        agent = agent_registry.resolve()
+        transport = LocalTransport()
+        bus = EventBus()
+        rec = Recorder()
+        bus.subscribe(rec)
+        s = CallSession(transport, agent=agent, stt_factory=FakeSTT,
+                        tts=tts or FakeTTS(), llm=FakeLLM(), bus=bus)
+        s._vad = SimpleNamespace(is_speech=lambda pcm_bytes, rate: True)
+        s.transport = transport
+        return s, bus, rec
+    made = []
+
+    def tracked(**kw):
+        r = make(**kw)
+        made.append(r[1])
+        return r
+    yield tracked
+    for bus in made:
+        bus.close()
+
+
+async def _user_turn(sess, text):
+    await sess.stt.on_event(STTEvent(kind="final", text=text))
+    await asyncio.sleep(0.1)
+    await sess._speak_task
+
+
+async def test_happy_path_event_sequence_and_latencies(rig):
+    sess, bus, rec = rig()
+    sess._llm.replies = [["एक वाक्य।"]]
+
+    await sess._dispatch(START)
+    await sess._speak_task
+    await sess._dispatch(PlaybackFinished())      # greeting drains
+    await _user_turn(sess, "haan boliye")
+    await sess._dispatch(PlaybackFinished())      # reply drains
+    await bus.flush()
+
+    assert rec.kinds() == [
+        "CallStarted",
+        "SpeechStarted",     # greeting (turn 0)
+        "SpeechEnded",
+        "ThinkingStarted",   # user turn committed
+        "ThinkingFinished",  # first clause available
+        "SpeechStarted",     # first reply audio
+        "TurnCompleted",     # pipeline done (audio still draining)
+        "SpeechEnded",       # playback drained at the carrier
+    ]
+    started = rec.only(events.CallStarted)[0]
+    assert started.call_id == "c1"
+    assert started.agent_id == "priya"
+
+    turn = rec.only(events.TurnCompleted)[0]
+    assert turn.turn_seq == 1
+    assert turn.user_text == "haan boliye"
+    assert turn.agent_text == "एक वाक्य।"
+    assert not turn.interrupted
+    assert turn.thinking_s is not None and turn.thinking_s >= 0
+    assert turn.first_audio_s is not None and turn.first_audio_s >= 0
+    # Greeting speech is turn 0; reply speech is turn 1
+    assert [e.turn_seq for e in rec.only(events.SpeechStarted)] == [0, 1]
+
+
+async def test_bargein_emits_agent_interrupted(rig):
+    sess, bus, rec = rig()
+    sess._llm.replies = [["एक वाक्य।"]]
+    await sess._dispatch(START)
+    await sess._speak_task
+    await sess._dispatch(PlaybackFinished())
+    await _user_turn(sess, "haan")
+    # Playback unfinished: draining tail keeps barge-in armed (D6).
+    for _ in range(3):
+        await sess._dispatch(media(LOUD_ULAW))
+    await bus.flush()
+
+    hits = rec.only(events.AgentInterrupted)
+    assert len(hits) == 1
+    assert hits[0].turn_seq == 1
+    assert hits[0].reaction_s >= 0
+
+
+async def test_superseding_turn_marks_first_turn_interrupted(rig):
+    # Same D1 scenario as the scripted test: clause two frozen inside TTS
+    # when the next user turn commits and cancels the pipeline.
+    tts = GatedTTS(block_indices={2})
+    sess, bus, rec = rig(tts=tts)
+    first_clause = "प" * 125 + "।"
+    sess._llm.replies = [[first_clause, " दूसरा वाक्य।"], ["theek hai."]]
+
+    await sess._dispatch(START)
+    await sess._speak_task
+    await sess._dispatch(PlaybackFinished())
+    await sess.stt.on_event(STTEvent(kind="final", text="pehla sawaal"))
+    await asyncio.sleep(0.1)
+    await sess.stt.on_event(STTEvent(kind="final", text="naya sawaal"))
+    await asyncio.sleep(0.1)
+    await sess._speak_task
+    await bus.flush()
+
+    turns = rec.only(events.TurnCompleted)
+    assert [(t.turn_seq, t.interrupted) for t in turns] == [(1, True), (2, False)]
+    assert turns[0].agent_text == first_clause  # D4: only what was heard
+    assert len(rec.only(events.AgentInterrupted)) == 1
+
+
+async def test_tool_audit_events(rig, monkeypatch):
+    sess, bus, rec = rig()
+    sess._llm.replies = [
+        ["ठीक है। [[BOOK day=Sunday time=4pm name=Rahul]] [[BROCHURE]]"]
+    ]
+
+    async def fake_save(call_id, caller, bk):
+        return None
+
+    async def fake_brochure(number):
+        raise RuntimeError("whatsapp api down")
+
+    monkeypatch.setattr(booking, "save_booking", fake_save)
+    monkeypatch.setattr(booking, "send_brochure", fake_brochure)
+
+    await sess._dispatch(START)
+    await sess._speak_task
+    await sess._dispatch(PlaybackFinished())
+    await _user_turn(sess, "Sunday aaunga")
+    await asyncio.sleep(0)  # let the fire-and-forget tool tasks run
+    await bus.flush()
+
+    assert {e.tool for e in rec.only(events.ToolCalled)} == {
+        "save_booking", "send_brochure"}
+    assert [e.tool for e in rec.only(events.ToolSucceeded)] == ["save_booking"]
+    failed = rec.only(events.ToolFailed)
+    assert [(e.tool, e.error) for e in failed] == [
+        ("send_brochure", "whatsapp api down")]
+
+
+async def test_run_lifecycle_emits_call_ended_and_session_closed(rig):
+    sess, bus, rec = rig()
+    sess.transport.feed(START)
+    sess.transport.feed(CallEnded())
+
+    await sess.run()
+    await bus.flush()
+
+    kinds = rec.kinds()
+    assert kinds[0] == "CallStarted"
+    assert kinds[-2:] == ["CallEnded", "SessionClosed"]

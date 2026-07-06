@@ -60,6 +60,17 @@ class SarvamTTS:
         self._language = language
         self._pace = pace
 
+    async def healthy(self) -> bool:
+        """SupportsHealth probe. Sarvam exposes no free authenticated GET,
+        so this checks reachability only: any HTTP response (even 405 on
+        this POST-only route) means the endpoint is up."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.get(TTS_URL)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def synthesize(self, text: str, fmt: AudioFormat) -> AsyncIterator[AudioFrame]:
         if fmt != MULAW_8K:
             raise ValueError(f"SarvamTTS only produces mu-law 8k today, asked for {fmt}")

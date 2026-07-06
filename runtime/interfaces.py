@@ -8,8 +8,9 @@ Deliberate deviations from RUNTIME_REDESIGN.md §4:
 - STT delivers events through an async callback instead of an `events()`
   iterator. Since M4 the callback is a thin bridge into the Turn Engine
   (which is where the rules live), so inverting to a pulled stream buys
-  nothing yet; it happens when something concrete needs it — the event
-  bus (M6) or a second concurrent STT.
+  nothing yet. M6's event bus did not need it either (the session, not
+  the STT, emits bus events); the remaining trigger is a second
+  concurrent STT.
 - LLM.stream takes plain chat messages; the `tools` parameter arrives with
   the tool registry (M7).
 - Transport has no dtmf/mark events yet — Vobiz doesn't surface them in the
@@ -17,11 +18,20 @@ Deliberate deviations from RUNTIME_REDESIGN.md §4:
 """
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Awaitable, Callable, Protocol
+from typing import Any, AsyncIterator, Awaitable, Callable, Protocol, runtime_checkable
 
 from runtime.types import AudioFormat, AudioFrame, LLMDelta, STTEvent, TransportEvent
 
 OnSTTEvent = Callable[[STTEvent], Awaitable[None]]
+
+
+@runtime_checkable
+class SupportsHealth(Protocol):
+    """Optional adapter capability: a cheap liveness/auth probe for
+    /health?deep=true. Not part of the core provider contracts — an
+    adapter without it simply reports as unprobeable."""
+
+    async def healthy(self) -> bool: ...
 
 
 class STT(Protocol):

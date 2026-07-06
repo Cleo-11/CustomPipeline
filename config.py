@@ -83,3 +83,13 @@ PARTIAL_INTERRUPT_AFTER_S = float(os.getenv("PARTIAL_INTERRUPT_AFTER_S", "0.5"))
 # masking LLM time-to-first-token (wired via the Turn Engine's THINKING
 # state since M4). Set to "" to disable.
 THINKING_FILLER = os.getenv("THINKING_FILLER", "हम्म")
+
+# ---------------------------------------------------------------------------
+# Observability
+# ---------------------------------------------------------------------------
+# "text" (dev default) or "json" — one JSON object per log line for prod
+# log pipelines. Structured conversation events are always logged as JSON
+# payloads by the event-log subscriber regardless of this setting.
+LOG_FORMAT = os.getenv("LOG_FORMAT", "text")
+# Where the transcript subscriber appends per-call JSONL records.
+TRANSCRIPTS_PATH = os.getenv("TRANSCRIPTS_PATH", "transcripts.jsonl")

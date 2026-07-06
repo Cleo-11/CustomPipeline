@@ -37,6 +37,15 @@ class OpenAICompatLLM:
         self._temperature = temperature
         self._max_tokens = max_tokens
 
+    async def healthy(self) -> bool:
+        """SupportsHealth probe: GET /models — validates reachability and,
+        where the endpoint enforces it, the API key."""
+        try:
+            await self._client.models.list()
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+
     async def stream(self, messages: list[Any]) -> AsyncIterator[LLMDelta]:
         stream = await self._client.chat.completions.create(
             model=self._model,

@@ -8,19 +8,27 @@ commit, cancel, timers), and runs the LLM→clauses→TTS→transport reply
 pipeline. All the *rules* — barge-in thresholds, greeting policy,
 endpointing, staleness — live in runtime/turn_engine.py where they are
 pure and replay-testable.
+
+Since M6 the session also announces what happens as typed events on the
+bus (runtime/events.py). Emission is a synchronous enqueue — never awaited
+on the audio path — and the session is correct with a NullBus: events are
+observations, not control flow.
 """
 from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from typing import Any, Coroutine
 
 import webrtcvad
 
 import audio
 import booking
+from runtime import events
 from runtime.agent import AgentConfig
 from runtime.clauses import stream_clauses
 from runtime.endpointing import Endpointer, FixedSilenceEndpointer, ProviderEndpointer
+from runtime.events import NULL_BUS, EventEmitter
 from runtime.interfaces import LLM, TTS, STTFactory, Transport
 from runtime.markers import extract_actions
 from runtime.turn_engine import (
@@ -30,6 +38,7 @@ from runtime.turn_engine import (
     Intent,
     PlayGreeting,
     TurnEngine,
+    TurnState,
 )
 from runtime.types import (
     MULAW_8K,
@@ -48,9 +57,11 @@ log = logging.getLogger("session")
 class CallSession:
     def __init__(self, transport: Transport, *, agent: AgentConfig,
                  stt_factory: STTFactory, tts: TTS, llm: LLM,
-                 engine: TurnEngine | None = None):
+                 engine: TurnEngine | None = None,
+                 bus: EventEmitter | None = None):
         self._transport = transport
         self.agent = agent
+        self._bus: EventEmitter = bus if bus is not None else NULL_BUS
         self.stream_id: str | None = None
         self.call_id: str | None = None
         self.caller_number: str = "unknown"
@@ -68,6 +79,17 @@ class CallSession:
         self._endpoint_timer: asyncio.Task | None = None
         self._speak_task: asyncio.Task | None = None
         self._vad = webrtcvad.Vad(agent.turn.vad_aggressiveness)
+
+        # Per-turn latency bookkeeping (reset at each CommitUserTurn) —
+        # measured here in the wiring, published as event payload.
+        self._turn_t0: float | None = None
+        self._thinking_s: float | None = None
+        self._first_audio_s: float | None = None
+        self._speech_started = False
+        self._last_user = ""
+
+    def _cid(self) -> str:
+        return self.call_id or "unknown"
 
     def _pick_endpointer(self) -> Endpointer:
         delay_s = self.agent.turn.endpoint_silence_ms / 1000
@@ -96,7 +118,16 @@ class CallSession:
         elif isinstance(ev, MediaReceived):
             await self._on_media(ev.frame)
         elif isinstance(ev, PlaybackFinished):
+            # If the engine leaves AGENT_SPEAKING here, the turn's audio
+            # truly finished at the carrier (post-drain, D6) — the moment
+            # SpeechEnded describes.
+            was_speaking = self._engine.state is TurnState.AGENT_SPEAKING
+            seq = self._engine.turn_seq
             await self._execute(self._engine.playback_finished())
+            if was_speaking and self._engine.state is not TurnState.AGENT_SPEAKING:
+                self._bus.emit(events.SpeechEnded(call_id=self._cid(), turn_seq=seq))
+        elif isinstance(ev, CallEnded):
+            self._bus.emit(events.CallEnded(call_id=self._cid()))
         # OutputCleared: the engine already left AGENT_SPEAKING when it
         # emitted CancelOutput; the carrier ack carries no new information.
 
@@ -105,6 +136,8 @@ class CallSession:
         self.call_id = ev.call_id
         self.caller_number = ev.caller
         log.info("Call start stream=%s call=%s", self.stream_id, self.call_id)
+        self._bus.emit(events.CallStarted(
+            call_id=self._cid(), caller=ev.caller, agent_id=self.agent.agent_id))
         await self.stt.start()
         await self._execute(self._engine.call_started())
 
@@ -148,6 +181,13 @@ class CallSession:
             elif isinstance(intent, CommitUserTurn):
                 log.info("USER: %s", intent.text)
                 self.messages.append({"role": "user", "content": intent.text})
+                self._last_user = intent.text
+                self._turn_t0 = self._now()
+                self._thinking_s = None
+                self._first_audio_s = None
+                self._speech_started = False
+                self._bus.emit(events.ThinkingStarted(
+                    call_id=self._cid(), turn_seq=intent.turn_seq))
                 self._speak_task = asyncio.create_task(
                     self._generate_and_speak(intent.turn_seq, intent.play_filler))
 
@@ -159,6 +199,7 @@ class CallSession:
         await self._execute(self._engine.endpoint_fired(generation))
 
     async def _cancel_output(self, turn_seq: int) -> None:
+        t0 = self._now()
         task = self._speak_task
         if task and not task.done():
             task.cancel()
@@ -167,6 +208,11 @@ class CallSession:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await self._transport.clear()
+        # reaction_s is the real mouth-shut latency: CancelOutput intent →
+        # pipeline unwound + carrier buffer cleared.
+        self._bus.emit(events.AgentInterrupted(
+            call_id=self._cid(), turn_seq=turn_seq,
+            reaction_s=self._now() - t0))
         log.info("Cancelled output for turn %s", turn_seq)
 
     # ------------------------------------------------------------ pipeline
@@ -181,30 +227,45 @@ class CallSession:
     async def _generate_and_speak(self, seq: int, play_filler: bool) -> None:
         spoken: list[str] = []
         frames = 0
+        interrupted = False
         gen = stream_clauses(self._llm.stream(self.messages))
 
         async def _next_clause() -> str | None:
             return await anext(gen, None)
 
+        async def _first_clause() -> str | None:
+            # Timestamped at actual availability, inside the task, so the
+            # filler playing in the foreground can't pollute the measurement.
+            clause = await anext(gen, None)
+            if clause is not None and self._turn_t0 is not None:
+                self._thinking_s = self._now() - self._turn_t0
+                self._bus.emit(events.ThinkingFinished(
+                    call_id=self._cid(), turn_seq=seq,
+                    thinking_s=self._thinking_s))
+            return clause
+
         # Start pulling the first clause *before* the filler plays, so the
         # filler genuinely masks LLM time-to-first-token instead of adding
         # to it.
-        first_task = asyncio.create_task(_next_clause())
+        first_task = asyncio.create_task(_first_clause())
         try:
             if play_filler:
                 frames += await self._speak(self.agent.turn.filler, seq)
             chunk = await first_task
             while chunk is not None:
                 if self._engine.is_stale(seq):
+                    interrupted = True
                     return
                 clean, bk, brochure = extract_actions(chunk)
                 if bk:
-                    asyncio.create_task(
+                    asyncio.create_task(self._run_tool(
+                        "save_booking",
                         booking.save_booking(
-                            self.call_id or "?", self.caller_name, bk))
+                            self.call_id or "?", self.caller_name, bk)))
                 if brochure:
-                    asyncio.create_task(
-                        booking.send_brochure(self.caller_number))
+                    asyncio.create_task(self._run_tool(
+                        "send_brochure",
+                        booking.send_brochure(self.caller_number)))
                 if clean:
                     log.info("LLM chunk: %s", clean)
                     frames += await self._speak(clean, seq)
@@ -213,6 +274,7 @@ class CallSession:
                     spoken.append(clean)
                 chunk = await _next_clause()
         except asyncio.CancelledError:
+            interrupted = True
             log.info("Reply turn %s cancelled (barge-in)", seq)
             raise
         finally:
@@ -221,8 +283,28 @@ class CallSession:
                 reply = " ".join(spoken)
                 self.messages.append({"role": "assistant", "content": reply})
                 log.info("PRIYA: %s", reply)
+            self._bus.emit(events.TurnCompleted(
+                call_id=self._cid(), turn_seq=seq,
+                user_text=self._last_user, agent_text=" ".join(spoken),
+                thinking_s=self._thinking_s,
+                first_audio_s=self._first_audio_s,
+                interrupted=interrupted))
             await self._execute(
                 self._engine.speaking_finished(seq, any_audio=frames > 0))
+
+    async def _run_tool(self, name: str, coro: Coroutine[Any, Any, None]) -> None:
+        """Fire-and-forget tool execution with audit events — the seed of
+        the M7 tool executor. Runs as its own task; never blocks the reply
+        pipeline, and a tool crash becomes a ToolFailed fact, not dead air."""
+        self._bus.emit(events.ToolCalled(call_id=self._cid(), tool=name))
+        try:
+            await coro
+        except Exception as e:  # noqa: BLE001
+            log.error("Tool %s failed: %s", name, e)
+            self._bus.emit(events.ToolFailed(
+                call_id=self._cid(), tool=name, error=str(e)))
+        else:
+            self._bus.emit(events.ToolSucceeded(call_id=self._cid(), tool=name))
 
     async def _speak(self, text: str, seq: int) -> int:
         """Synthesize and play one utterance; returns frames actually sent."""
@@ -232,6 +314,14 @@ class CallSession:
         try:
             async for frame in self.tts.synthesize(text, MULAW_8K):
                 frame_count += 1
+                if frame_count == 1 and not self._speech_started:
+                    # First audible output of this turn (filler counts —
+                    # this is when the caller hears the agent respond).
+                    self._speech_started = True
+                    if self._turn_t0 is not None:
+                        self._first_audio_s = self._now() - self._turn_t0
+                    self._bus.emit(events.SpeechStarted(
+                        call_id=self._cid(), turn_seq=seq))
                 await self._transport.play(frame)
             log.info("SPEAK done: %d frames sent", frame_count)
             # The transport no-ops this before the call starts.
@@ -249,3 +339,4 @@ class CallSession:
             if t and not t.done():
                 t.cancel()
         await self.stt.close()
+        self._bus.emit(events.SessionClosed(call_id=self._cid()))

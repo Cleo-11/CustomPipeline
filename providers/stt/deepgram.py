@@ -11,6 +11,7 @@ import json
 import logging
 from typing import Any
 
+import httpx
 import websockets
 
 from runtime.interfaces import OnSTTEvent
@@ -54,6 +55,19 @@ class DeepgramSTT:
         self._ws: Any = None
         self._closed = False
         self._reader: asyncio.Task | None = None
+
+    async def healthy(self) -> bool:
+        """SupportsHealth probe: Deepgram's REST /v1/projects with our key —
+        validates both reachability and the credential."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                r = await client.get(
+                    "https://api.deepgram.com/v1/projects",
+                    headers={"Authorization": f"Token {self._api_key}"},
+                )
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
 
     async def start(self) -> None:
         try:

@@ -2,10 +2,16 @@
 booking.py — Capture appointments and send the brochure on WhatsApp.
 
 Bookings are appended to a JSONL file (swap for Postgres/your CRM in prod).
-Brochure delivery uses Vobiz's WhatsApp Business API. Both are best-effort and
-never block the voice loop — call them with asyncio.create_task().
+Brochure delivery uses Vobiz's WhatsApp Business API. Both are best-effort
+and never block the voice loop — the session runs them through its tool
+runner (fire-and-forget task + ToolCalled/Succeeded/Failed audit events).
+
+Since M6, failures RAISE instead of being swallowed here: the tool runner
+owns the catch, so every failure becomes a ToolFailed event on the bus.
+This module dissolves into Priya's registered tools in M7.
 """
 from __future__ import annotations
+import asyncio
 import json
 import logging
 import time
@@ -21,6 +27,11 @@ _STORE = Path("bookings.jsonl")
 BROCHURE_URL = "https://your-cdn.example.com/northern-heights-brochure.pdf"
 
 
+def _append_line(record: dict) -> None:
+    with _STORE.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
 async def save_booking(call_id: str, caller: str, booking: dict) -> None:
     record = {
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -28,19 +39,13 @@ async def save_booking(call_id: str, caller: str, booking: dict) -> None:
         "caller": caller,
         **booking,
     }
-    try:
-        with _STORE.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        log.info("Booking saved: %s", record)
-    except Exception as e:  # noqa: BLE001
-        log.error("Booking save failed: %s", e)
+    # D8: the file write runs in a worker thread, never on the event loop.
+    await asyncio.to_thread(_append_line, record)
+    log.info("Booking saved: %s", record)
 
 
 async def send_brochure(to_number: str) -> None:
     """Send the project brochure to the caller's WhatsApp via Vobiz."""
-    if not (config.VOBIZ_AUTH_ID and config.VOBIZ_AUTH_TOKEN):
-        log.warning("Vobiz creds missing; skipping brochure send")
-        return
     url = f"{config.VOBIZ_API_BASE}/Account/{config.VOBIZ_AUTH_ID}/whatsapp/messages"
     headers = {
         "Content-Type": "application/json",
@@ -56,9 +61,7 @@ async def send_brochure(to_number: str) -> None:
             "caption": "Northern Heights, Dahisar East — N Rose Developers",
         },
     }
-    try:
-        async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.post(url, json=payload, headers=headers)
-            log.info("Brochure -> %s (HTTP %s)", to_number, r.status_code)
-    except Exception as e:  # noqa: BLE001
-        log.error("Brochure send failed: %s", e)
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(url, json=payload, headers=headers)
+        log.info("Brochure -> %s (HTTP %s)", to_number, r.status_code)
+        r.raise_for_status()

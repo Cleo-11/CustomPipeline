@@ -5,7 +5,8 @@ Exposes:
   POST /answer        -> returns <Stream> XML telling Vobiz to open a WS to /ws
   POST /hangup        -> call-ended webhook (logging / CRM hook)
   POST /stream-status -> stream lifecycle events
-  GET  /health        -> liveness check
+  GET  /health        -> liveness check; ?deep=true probes provider health
+  GET  /metrics       -> Prometheus text exposition (per-turn latency, counts)
   WS   /ws            -> the bidirectional audio stream; one CallSession each.
                          Requires ?token=<WS_AUTH_TOKEN>, which /answer embeds
                          in the URL it hands to Vobiz.
@@ -21,6 +22,7 @@ Run:  uvicorn server:app --host 0.0.0.0 --port 8000 --workers 1
 call pins one event loop)
 """
 from __future__ import annotations
+import asyncio
 import logging
 import secrets
 from dataclasses import dataclass
@@ -34,7 +36,11 @@ from providers.stt.deepgram import DeepgramSTT
 from providers.tts.sarvam import SarvamTTS
 from runtime.agent import AgentConfig
 from runtime.agent_registry import resolve as resolve_agent
-from runtime.interfaces import LLM, TTS, OnSTTEvent, STTFactory
+from runtime.events import EventBus
+from runtime.interfaces import LLM, TTS, OnSTTEvent, STTFactory, SupportsHealth
+from runtime.metrics import MetricsRegistry, TurnMetrics
+from runtime.sinks import EventLogSubscriber, JsonFormatter, TranscriptWriter
+from runtime.types import STTEvent
 from session import CallSession
 from transports.vobiz import VobizTransport
 
@@ -42,9 +48,23 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+if config.LOG_FORMAT == "json":
+    for _handler in logging.getLogger().handlers:
+        _handler.setFormatter(JsonFormatter())
 log = logging.getLogger("server")
 
 app = FastAPI(title="Northern Heights Voice Agent")
+
+# ---------------------------------------------------------------------------
+# Observability wiring (M6): one process-wide bus; sinks subscribe here at
+# the composition root, never inside runtime modules. Every subscriber is
+# a pure observer — removing any of them changes nothing about a call.
+# ---------------------------------------------------------------------------
+BUS = EventBus()
+METRICS = MetricsRegistry()
+BUS.subscribe(EventLogSubscriber())
+BUS.subscribe(TurnMetrics(METRICS))
+BUS.subscribe(TranscriptWriter(config.TRANSCRIPTS_PATH))
 
 
 # ---------------------------------------------------------------------------
@@ -138,9 +158,43 @@ async def stream_status(request: Request):
 
 
 @app.get("/health")
-async def health():
+async def health(deep: bool = False):
     # The tokened WS URL is a secret; only Vobiz (via /answer) gets it.
-    return {"status": "ok"}
+    if not deep:
+        return {"status": "ok"}
+    # Deep mode probes provider reachability with the default agent's
+    # provider set. Probes are concurrent and individually time-boxed so a
+    # hung vendor can't hang the health check.
+    providers = _build_providers(resolve_agent())
+
+    async def _ignore(ev: STTEvent) -> None:
+        return
+
+    probes: dict[str, object] = {
+        "llm": providers.llm,
+        "tts": providers.tts,
+        "stt": providers.stt_factory(_ignore),
+    }
+
+    async def _probe(obj: object) -> bool | None:
+        if not isinstance(obj, SupportsHealth):
+            return None  # adapter offers no probe
+        try:
+            return await asyncio.wait_for(obj.healthy(), timeout=5.0)
+        except Exception:  # noqa: BLE001
+            return False
+
+    results = dict(zip(probes, await asyncio.gather(*map(_probe, probes.values()))))
+    ok = all(v is not False for v in results.values())
+    return {"status": "ok" if ok else "degraded", "providers": results}
+
+
+@app.get("/metrics")
+async def metrics():
+    return PlainTextResponse(
+        METRICS.render(),
+        media_type="text/plain; version=0.0.4; charset=utf-8",
+    )
 
 
 @app.websocket("/ws")
@@ -161,6 +215,7 @@ async def ws(websocket: WebSocket):
     session = CallSession(
         transport, agent=agent,
         stt_factory=providers.stt_factory, tts=providers.tts, llm=providers.llm,
+        bus=BUS,
     )
     try:
         await session.run()

@@ -140,6 +140,9 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `runtime/endpointing.py` | Pluggable end-of-turn strategies (fixed silence / provider-trusting) |
 | `runtime/agent.py` | `AgentConfig`: the agent as a data record (persona + voice/STT/LLM/turn policy) |
 | `runtime/agent_registry.py` | Resolves a call to its `AgentConfig`, defaulting to Priya |
+| `runtime/events.py` | Typed conversation events + the non-blocking in-process event bus |
+| `runtime/metrics.py` | Latency/counter registry, Prometheus text exposition, turn-metrics subscriber |
+| `runtime/sinks.py` | Bus subscribers: structured event log, transcript JSONL, JSON log formatter |
 | `agents/priya.json` | Priya/Northern Heights — the reference agent, as data |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
 | `transports/vobiz.py` | Vobiz WS adapter: event normalization, single-writer sends, deadline frame pacing |
@@ -152,6 +155,30 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `config.py` | Deployment engine defaults + credentials (no longer the agent) |
 | `make_call.py` | Outbound dialer |
 | `tests/` | Characterization tests: audio codec, clause chunking, scripted call flows, route auth |
+
+---
+
+## Observability (M6)
+
+Everything important on a call is announced as a typed event on an
+in-process bus (`runtime/events.py`); logs, metrics and transcripts are
+subscribers, not inline concerns. Emission is a synchronous enqueue —
+nothing on the audio path ever waits for an observer.
+
+- **`GET /metrics`** — Prometheus text format. The README's latency budget
+  is measured for real: `turn_thinking_seconds` (turn commit → first
+  speakable clause), `turn_first_audio_seconds` (commit → first audio
+  frame, filler included — perceived response time),
+  `bargein_reaction_seconds` (cancel intent → audio dead + buffer cleared),
+  plus call/turn/interruption/tool counters.
+- **`GET /health?deep=true`** — probes provider reachability (Deepgram
+  auth, LLM `/models`, Sarvam endpoint) concurrently, 5s time-box each.
+- **`transcripts.jsonl`** — per-call lifecycle + per-turn records (what was
+  actually spoken, with latencies), appended by a subscriber off the loop.
+- **`LOG_FORMAT=json`** — one JSON object per log line for prod pipelines.
+- Booking/brochure calls now run through the session's tool runner:
+  `ToolCalled/ToolSucceeded/ToolFailed` audit events, file I/O off the
+  event loop.
 
 ---
 

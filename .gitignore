@@ -16,3 +16,4 @@ venv/
 # Runtime artifacts
 *.log
 bookings.jsonl
+transcripts.jsonl
