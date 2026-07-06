@@ -40,6 +40,7 @@ from runtime.agent_registry import resolve as resolve_agent
 from runtime.events import EventBus
 from runtime.interfaces import LLM, TTS, OnSTTEvent, STTFactory, SupportsHealth
 from runtime.metrics import MetricsRegistry, TurnMetrics
+from runtime.resilience import CircuitBreaker, ResilientLLM, ResilientTTS
 from runtime.sinks import EventLogSubscriber, JsonFormatter, TranscriptWriter
 from runtime.tools import (
     MarkerToolStrategy,
@@ -106,20 +107,23 @@ def _build_providers(agent: AgentConfig) -> _Providers:
     cached = _provider_cache.get(agent.agent_id)
     if cached is not None:
         return cached
-    llm = OpenAICompatLLM(
+    # M8: vendors are wrapped in resilience decorators here, at the edge —
+    # bounded retry, first-token timeout, circuit-breaker-lite. Breakers
+    # are per agent (this cache's granularity), shared across its calls.
+    llm: LLM = ResilientLLM(OpenAICompatLLM(
         base_url=agent.llm.base_url,
         api_key=config.LLM_API_KEY,
         model=agent.llm.model,
         temperature=agent.llm.temperature,
         max_tokens=agent.llm.max_tokens,
-    )
-    tts = SarvamTTS(
+    ), breaker=CircuitBreaker())
+    tts: TTS = ResilientTTS(SarvamTTS(
         api_key=config.SARVAM_API_KEY,
         model=agent.voice.model,
         speaker=agent.voice.speaker,
         language=agent.voice.language,
         pace=agent.voice.pace,
-    )
+    ), breaker=CircuitBreaker())
 
     def stt_factory(on_event: OnSTTEvent) -> DeepgramSTT:
         return DeepgramSTT(
@@ -144,8 +148,25 @@ def _build_providers(agent: AgentConfig) -> _Providers:
     return providers
 
 
+# M8 (D10 closed): every webhook route requires the shared secret in its
+# URL — make_call.py embeds it in answer/hangup URLs, /answer embeds it in
+# the status-callback URL, and inbound Answer URLs configured in the Vobiz
+# dashboard must include ?token=<WS_AUTH_TOKEN>. Vobiz publishes no webhook
+# signature scheme for us to verify, so a URL-borne secret is the strongest
+# available check (same tradeoff as M0's WS token: it appears in carrier
+# logs, which we accept).
+def _webhook_authorized(request: Request) -> bool:
+    token = request.query_params.get("token", "")
+    if secrets.compare_digest(token, config.WS_AUTH_TOKEN):
+        return True
+    log.warning("Rejected webhook %s: bad or missing token", request.url.path)
+    return False
+
+
 @app.post("/answer")
 async def answer(request: Request):
+    if not _webhook_authorized(request):
+        return PlainTextResponse("Forbidden", status_code=403)
     form = await request.form()
     log.info("answer webhook: From=%s To=%s Dir=%s",
              form.get("From"), form.get("To"), form.get("Direction"))
@@ -156,7 +177,8 @@ async def answer(request: Request):
     ws_url = f"wss://{config.PUBLIC_HOST}/ws?token={config.WS_AUTH_TOKEN}"
     if agent_id:
         ws_url += f"&agent={agent_id}"
-    status_url = f"https://{config.PUBLIC_HOST}/stream-status"
+    status_url = (f"https://{config.PUBLIC_HOST}/stream-status"
+                  f"?token={config.WS_AUTH_TOKEN}")
     xml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
@@ -171,6 +193,8 @@ async def answer(request: Request):
 
 @app.post("/hangup")
 async def hangup(request: Request):
+    if not _webhook_authorized(request):
+        return PlainTextResponse("Forbidden", status_code=403)
     form = await request.form()
     log.info("hangup: UUID=%s Duration=%ss Cause=%s",
              form.get("CallUUID"), form.get("Duration"), form.get("HangupCause"))
@@ -179,6 +203,8 @@ async def hangup(request: Request):
 
 @app.post("/stream-status")
 async def stream_status(request: Request):
+    if not _webhook_authorized(request):
+        return PlainTextResponse("Forbidden", status_code=403)
     form = await request.form()
     log.info("stream-status: %s", dict(form))
     return PlainTextResponse("OK")

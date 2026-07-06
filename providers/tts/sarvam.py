@@ -90,27 +90,23 @@ class SarvamTTS:
             "pace": self._pace,
         }
 
-        try:
-            async with httpx.AsyncClient(timeout=15) as client:
-                r = await client.post(TTS_URL, json=payload, headers=headers)
-                r.raise_for_status()
-                data = r.json()
+        # Failures RAISE (since M8): the ResilientTTS wrapper owns the
+        # retry/breaker decision, and the session owns the fallback line.
+        # Swallowing here would hide every failure from both.
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(TTS_URL, json=payload, headers=headers)
+            r.raise_for_status()
+            data = r.json()
 
-                audios = data.get("audios", [])
-                if not audios:
-                    log.error("TTS returned no audio. Full response: %s", data)
-                    return
+        audios = data.get("audios", [])
+        if not audios:
+            raise RuntimeError(f"TTS returned no audio: {data}")
 
-                raw = base64.b64decode(audios[0])
-                src_rate, pcm = _parse_wav(raw)
-                log.info("TTS WAV: %dHz, %d samples", src_rate, len(pcm))
+        raw = base64.b64decode(audios[0])
+        src_rate, pcm = _parse_wav(raw)
+        log.info("TTS WAV: %dHz, %d samples", src_rate, len(pcm))
 
-                frames = audio.pcm16_to_vobiz_frames(pcm, src_rate=src_rate)
-                log.info("TTS producing %d frames", len(frames))
-                for frame in frames:
-                    yield AudioFrame(payload=frame, format=MULAW_8K)
-
-        except httpx.HTTPStatusError as e:
-            log.error("TTS HTTP error %s: %s", e.response.status_code, e.response.text)
-        except Exception as e:  # noqa: BLE001
-            log.error("TTS error: %s", e)
+        frames = audio.pcm16_to_vobiz_frames(pcm, src_rate=src_rate)
+        log.info("TTS producing %d frames", len(frames))
+        for frame in frames:
+            yield AudioFrame(payload=frame, format=MULAW_8K)

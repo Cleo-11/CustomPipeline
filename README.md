@@ -109,6 +109,10 @@ For **inbound**, point your Vobiz Application's Answer URL at
 - Run behind a real TLS domain; set `PUBLIC_HOST` to it (drop ngrok).
 - `/ws` only accepts connections presenting `WS_AUTH_TOKEN` — it's embedded in
   the URL `/answer` hands to Vobiz, so callers need no extra setup.
+- **All webhook routes require the same token since M8** (`?token=<WS_AUTH_TOKEN>`).
+  `make_call.py` embeds it automatically; for **inbound**, your Vobiz
+  Application's Answer URL must be
+  `https://<PUBLIC_HOST>/answer?token=<WS_AUTH_TOKEN>`.
 - `uvicorn server:app --port 8000 --workers 1`, then scale **horizontally**
   (more single-worker processes behind a load balancer). Each live call pins
   one asyncio loop and holds 1 Vobiz WS + 1 Sarvam STT WS + short-lived TTS WS.
@@ -144,6 +148,8 @@ chat turns. Budget ~5–6 GB VRAM at q4.
 | `runtime/metrics.py` | Latency/counter registry, Prometheus text exposition, turn-metrics subscriber |
 | `runtime/sinks.py` | Bus subscribers: structured event log, transcript JSONL, JSON log formatter |
 | `runtime/tools.py` | Tool registry + executor (timeout/retry/audit events) + marker/native dispatch strategies |
+| `runtime/resilience.py` | Circuit-breaker-lite + resilient TTS/LLM wrappers (bounded retry, first-token timeout) |
+| `runtime/context.py` | Proto Context Compiler: conversation-history budget with oldest-turn eviction |
 | `agents/priya_tools.py` | Priya's business tools: site-visit booking, WhatsApp brochure (was `booking.py`) |
 | `agents/priya.json` | Priya/Northern Heights — the reference agent, as data |
 | `runtime/` | Provider-agnostic core: types, capability-typed interfaces, clause chunking, marker parsing |
@@ -204,6 +210,28 @@ agent's `llm.tool_dispatch`):
 
 Tool results are not fed back to the model (fire-and-forget), matching the
 original marker contract.
+
+---
+
+## Reliability (M8)
+
+One vendor blip degrades the call instead of silencing or killing it:
+
+- **STT reconnect** — a dropped Deepgram socket reconnects in the
+  background with jittered backoff (5 attempts); frames during the outage
+  are dropped, transcripts resume on recovery. If the budget is exhausted
+  the call continues one-way and a `ProviderFailed` alarm event fires.
+- **TTS** — per-clause timeout + one retry (only if no audio was sent —
+  never replays), behind a circuit breaker that skips a dead provider for
+  30s instead of stacking doomed retries onto the hot path.
+- **LLM** — first-token timeout (a dead endpoint hangs exactly there) +
+  breaker; mid-stream errors still speak whatever text already arrived.
+- **Fallback line** — a turn that produces no audio at all speaks
+  `FALLBACK_LINE` instead of dead air (never enters history).
+- **History cap** — `HISTORY_MAX_MESSAGES`/`HISTORY_MAX_CHARS` evict the
+  oldest turns so an hour-long call can't inflate LLM latency unbounded.
+- **Webhook auth** — every webhook route requires `?token=` (see
+  Production above).
 
 ---
 

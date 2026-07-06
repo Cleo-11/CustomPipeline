@@ -52,11 +52,13 @@ def test_from_dict_fills_every_section_from_defaults():
         "voice": {"model": "m", "speaker": "s", "language": "l", "pace": 1.0},
         "stt": {"model": "nova-2", "language": "hi", "endpointer": "fixed"},
         "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5,
-                "max_tokens": 128, "tool_dispatch": "marker"},
+                "max_tokens": 128, "tool_dispatch": "marker",
+                "history_max_messages": 24, "history_max_chars": 6000},
         "turn": {
             "endpoint_silence_ms": 550, "bargein_rms_threshold": 650.0,
             "bargein_min_frames": 25, "vad_aggressiveness": 2,
             "partial_interrupt_after_s": 0.5, "filler": "हम्म",
+            "fallback_line": "sorry",
         },
     }
     # A spec that pins nothing but the required persona fields.
@@ -78,11 +80,13 @@ def test_from_dict_spec_overrides_defaults():
         "voice": {"model": "m", "speaker": "default-voice", "language": "l", "pace": 1.0},
         "stt": {"model": "nova-2", "language": "hi", "endpointer": "fixed"},
         "llm": {"base_url": "u", "model": "gpt", "temperature": 0.5,
-                "max_tokens": 128, "tool_dispatch": "marker"},
+                "max_tokens": 128, "tool_dispatch": "marker",
+                "history_max_messages": 24, "history_max_chars": 6000},
         "turn": {
             "endpoint_silence_ms": 550, "bargein_rms_threshold": 650.0,
             "bargein_min_frames": 25, "vad_aggressiveness": 2,
             "partial_interrupt_after_s": 0.5, "filler": "",
+            "fallback_line": "",
         },
     }
     spec = {

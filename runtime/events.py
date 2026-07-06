@@ -143,10 +143,30 @@ class SessionClosed:
     call_id: str
 
 
+@dataclass(frozen=True)
+class ProviderFailed:
+    """Alarm-grade: a provider is gone beyond its retry budget (e.g. the
+    recognizer could not be reconnected — the call is deaf, M8/D5)."""
+
+    call_id: str
+    provider: str  # "stt" | "tts" | "llm"
+    error: str
+
+
+@dataclass(frozen=True)
+class FallbackSpoken:
+    """The reply pipeline produced nothing (LLM/TTS failure or open
+    breaker) and the scripted fallback line was spoken instead of silence."""
+
+    call_id: str
+    turn_seq: int
+
+
 Event = (
     CallStarted | CallEnded | ThinkingStarted | ThinkingFinished
     | SpeechStarted | SpeechEnded | AgentInterrupted | TurnCompleted
     | ToolCalled | ToolSucceeded | ToolFailed | SessionClosed
+    | ProviderFailed | FallbackSpoken
 )
 
 Subscriber = Callable[[Event], Awaitable[None]]

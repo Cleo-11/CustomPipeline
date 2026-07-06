@@ -53,6 +53,11 @@ class LLMPolicy:
     temperature: float
     max_tokens: int
     tool_dispatch: str
+    # Conversation-history budget (M8): oldest-turn eviction keeps a long
+    # call from inflating context without bound. LLM policy because the
+    # budget is really about this model's latency/cost envelope.
+    history_max_messages: int
+    history_max_chars: int
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,9 @@ class TurnSettings:
     vad_aggressiveness: int
     partial_interrupt_after_s: float
     filler: str
+    # Spoken when a reply turn yields no audio (provider failure) — heard
+    # degradation instead of dead air (M8). "" disables.
+    fallback_line: str
 
     def engine_policy(self) -> TurnPolicy:
         """The subset the pure Turn Engine consumes."""

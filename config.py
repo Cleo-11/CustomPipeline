@@ -87,6 +87,18 @@ PARTIAL_INTERRUPT_AFTER_S = float(os.getenv("PARTIAL_INTERRUPT_AFTER_S", "0.5"))
 # masking LLM time-to-first-token (wired via the Turn Engine's THINKING
 # state since M4). Set to "" to disable.
 THINKING_FILLER = os.getenv("THINKING_FILLER", "हम्म")
+# Spoken when a reply turn produces no audio at all (LLM/TTS failure or an
+# open circuit breaker) — degradation the caller can hear instead of dead
+# air (M8). Set to "" to disable.
+FALLBACK_LINE = os.getenv(
+    "FALLBACK_LINE",
+    "माफ़ कीजिए, एक छोटी सी technical दिक्कत आ गई। क्या आप दोबारा बोल सकते हैं?")
+
+# Conversation-history budget per call (M8): oldest turns are evicted once
+# either cap is exceeded, so a long call can't inflate LLM latency/cost
+# without bound. The system prompt never counts against these.
+HISTORY_MAX_MESSAGES = int(os.getenv("HISTORY_MAX_MESSAGES", "24"))
+HISTORY_MAX_CHARS = int(os.getenv("HISTORY_MAX_CHARS", "6000"))
 
 # ---------------------------------------------------------------------------
 # Observability

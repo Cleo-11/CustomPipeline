@@ -59,11 +59,28 @@ def test_metrics_endpoint_renders_prometheus_text():
 
 
 def test_answer_returns_stream_xml_with_tokened_ws_url():
-    r = client.post("/answer", data={"From": "+911234567890", "To": "+911100000000"})
+    r = client.post(f"/answer?token={config.WS_AUTH_TOKEN}",
+                    data={"From": "+911234567890", "To": "+911100000000"})
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("application/xml")
     assert f"wss://{config.PUBLIC_HOST}/ws?token={config.WS_AUTH_TOKEN}" in r.text
     assert 'bidirectional="true"' in r.text
+    # The status-callback URL Vobiz will hit is itself tokened (M8/D10).
+    assert f"/stream-status?token={config.WS_AUTH_TOKEN}" in r.text
+
+
+def test_webhooks_reject_missing_or_bad_token():
+    # D10 closed in full: every webhook route requires the shared secret.
+    assert client.post("/answer", data={}).status_code == 403
+    assert client.post("/answer?token=wrong", data={}).status_code == 403
+    assert client.post("/hangup", data={}).status_code == 403
+    assert client.post("/stream-status", data={}).status_code == 403
+
+
+def test_hangup_and_stream_status_accept_valid_token():
+    ok = f"?token={config.WS_AUTH_TOKEN}"
+    assert client.post(f"/hangup{ok}", data={"CallUUID": "x"}).status_code == 200
+    assert client.post(f"/stream-status{ok}", data={}).status_code == 200
 
 
 def test_ws_rejects_missing_token():

@@ -110,6 +110,12 @@ class TurnMetrics:
             "tool_calls_total", "Tool executions started")
         self.tool_failures = registry.counter(
             "tool_failures_total", "Tool executions that raised")
+        self.provider_failures = registry.counter(
+            "provider_failures_total",
+            "Providers lost beyond their retry budget (alarm-grade)")
+        self.fallbacks = registry.counter(
+            "fallbacks_total",
+            "Turns that spoke the scripted fallback line instead of a reply")
         self.thinking = registry.histogram(
             "turn_thinking_seconds",
             "Turn commit to first speakable clause (LLM TTFT + clause accumulation)")
@@ -137,3 +143,7 @@ class TurnMetrics:
             self.tool_calls.inc()
         elif isinstance(event, events.ToolFailed):
             self.tool_failures.inc()
+        elif isinstance(event, events.ProviderFailed):
+            self.provider_failures.inc()
+        elif isinstance(event, events.FallbackSpoken):
+            self.fallbacks.inc()

@@ -303,6 +303,59 @@ async def test_booking_and_brochure_markers_dispatch(monkeypatch):
     assert all("[[" not in t for t in sess.tts.texts)
 
 
+async def test_fallback_line_spoken_when_reply_produces_nothing(sess):
+    # LLM yields no deltas at all (dead endpoint / open breaker): the
+    # caller hears the scripted apology, not dead air (M8).
+    sess._llm.replies = [[]]
+    await start_call(sess)
+    await run_user_turn(sess, "hello?")
+
+    assert sess.tts.texts[-1] == sess.agent.turn.fallback_line
+    # The model never said it: history holds the user turn, no assistant.
+    assert sess.messages[-1] == {"role": "user", "content": "hello?"}
+
+
+async def test_no_fallback_for_marker_only_reply(monkeypatch):
+    # A reply that is pure tool call (no speech) is a completed reply,
+    # not a failure — apologizing would be wrong.
+    brochures = []
+
+    async def fake_book(ctx, args):
+        return None
+
+    async def fake_brochure(ctx, args):
+        brochures.append(ctx.caller_number)
+
+    sess = make_sess(monkeypatch,
+                     tool_registry=fake_tool_registry(fake_book, fake_brochure))
+    sess._llm.replies = [["[[BROCHURE]]"]]
+    await start_call(sess)
+    await run_user_turn(sess, "brochure bhejo")
+    await asyncio.sleep(0.05)
+
+    assert brochures == ["+911234567890"]
+    assert sess.agent.turn.fallback_line not in sess.tts.texts
+
+
+async def test_history_is_capped_before_the_llm_sees_it(monkeypatch):
+    monkeypatch.setattr(config, "HISTORY_MAX_MESSAGES", 4)
+    sess = make_sess(monkeypatch)
+    sess._llm.replies = [["ठीक है।"]]
+    await start_call(sess)
+    # Simulate a long call: pad history far beyond the budget.
+    for i in range(20):
+        sess.messages.append({"role": "user", "content": f"u{i}"})
+        sess.messages.append({"role": "assistant", "content": f"a{i}"})
+
+    await run_user_turn(sess, "latest question")
+
+    # system + trimmed tail (ending in the new user turn) + new reply
+    assert sess.messages[0]["role"] == "system"
+    assert len(sess.messages) == 1 + 4 + 1
+    assert sess.messages[-2] == {"role": "user", "content": "latest question"}
+    assert sess.messages[-1] == {"role": "assistant", "content": "ठीक है।"}
+
+
 async def test_run_loop_plays_greeting_and_cleans_up(sess):
     """Full lifecycle through run(): events in via the transport queue."""
     sess.transport.feed(START)

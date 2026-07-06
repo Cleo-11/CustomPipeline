@@ -38,9 +38,13 @@ class STTEvent:
     "endpoint" = the provider believes the utterance is over (Deepgram
     UtteranceEnd). Only consulted when the Turn Engine's endpointer is
     provider-trusting; text is empty for this kind.
+
+    "dead" = the recognizer is permanently lost (reconnect budget
+    exhausted, M8/D5). The session raises the deaf-call alarm; the call
+    itself continues — a one-way agent beats a dropped line.
     """
 
-    kind: Literal["partial", "final", "endpoint"]
+    kind: Literal["partial", "final", "endpoint", "dead"]
     text: str
 
 

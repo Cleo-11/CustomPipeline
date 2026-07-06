@@ -24,6 +24,7 @@ import webrtcvad
 import audio
 from runtime import events
 from runtime.agent import AgentConfig
+from runtime.context import trim_history
 from runtime.endpointing import Endpointer, FixedSilenceEndpointer, ProviderEndpointer
 from runtime.events import NULL_BUS, EventEmitter
 from runtime.interfaces import LLM, TTS, STTFactory, Transport
@@ -96,6 +97,7 @@ class CallSession:
         self._first_audio_s: float | None = None
         self._speech_started = False
         self._last_user = ""
+        self._turn_had_tools = False
 
     def _cid(self) -> str:
         return self.call_id or "unknown"
@@ -173,6 +175,13 @@ class CallSession:
             await self._execute(self._engine.stt_final(ev.text))
         elif ev.kind == "endpoint":
             await self._execute(self._engine.stt_endpoint())
+        elif ev.kind == "dead":
+            # D5 alarm: the recognizer is gone beyond its reconnect budget.
+            # The call continues one-way; operators get a loud fact.
+            log.error("STT is dead for call %s — the call is deaf", self._cid())
+            self._bus.emit(events.ProviderFailed(
+                call_id=self._cid(), provider="stt",
+                error="recognizer lost; reconnect budget exhausted"))
 
     # ------------------------------------------------------------- intents
     async def _execute(self, intents: list[Intent]) -> None:
@@ -195,6 +204,7 @@ class CallSession:
                 self._thinking_s = None
                 self._first_audio_s = None
                 self._speech_started = False
+                self._turn_had_tools = False
                 self._bus.emit(events.ThinkingStarted(
                     call_id=self._cid(), turn_seq=intent.turn_seq))
                 self._speak_task = asyncio.create_task(
@@ -236,6 +246,7 @@ class CallSession:
     def _dispatch_tool(self, name: str, args: dict) -> None:
         """Route a tool call from the dispatch strategy to the executor.
         Synchronous — the executor runs the tool in its own task."""
+        self._turn_had_tools = True
         if self._tool_executor is None:
             log.warning("Tool call %r dropped: no executor wired", name)
             return
@@ -250,6 +261,12 @@ class CallSession:
         spoken: list[str] = []
         frames = 0
         interrupted = False
+        # Proto Context Compiler (M8): cap history before it reaches the
+        # model, so hour-long calls can't inflate latency without bound.
+        self.messages = trim_history(
+            self.messages,
+            max_messages=self.agent.llm.history_max_messages,
+            max_chars=self.agent.llm.history_max_chars)
         gen = self._tooling.clauses(self._llm, self.messages, self._dispatch_tool)
 
         async def _next_clause() -> str | None:
@@ -281,11 +298,25 @@ class CallSession:
                 # The dispatch strategy already stripped tool calls and
                 # routed them; chunks arriving here are pure speech.
                 log.info("LLM chunk: %s", chunk)
-                frames += await self._speak(chunk, seq)
-                # D4: history records what the caller actually heard —
-                # a clause counts only once fully played out.
-                spoken.append(chunk)
+                clause_frames = await self._speak(chunk, seq)
+                frames += clause_frames
+                # D4: history records what the caller actually heard — a
+                # clause counts only if its audio went out (a TTS failure
+                # yields zero frames and must not enter the transcript).
+                if clause_frames:
+                    spoken.append(chunk)
                 chunk = await _next_clause()
+            # Nothing spoken and no tool fired: the pipeline failed (LLM
+            # died, TTS breaker open, empty stream). Degrade audibly (M8) —
+            # a scripted apology beats dead air. Never enters history: the
+            # model didn't say it.
+            if (not spoken and not self._turn_had_tools
+                    and not self._engine.is_stale(seq)
+                    and self.agent.turn.fallback_line):
+                log.warning("Turn %d produced nothing; speaking fallback line", seq)
+                self._bus.emit(events.FallbackSpoken(
+                    call_id=self._cid(), turn_seq=seq))
+                frames += await self._speak(self.agent.turn.fallback_line, seq)
         except asyncio.CancelledError:
             interrupted = True
             log.info("Reply turn %s cancelled (barge-in)", seq)

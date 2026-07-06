@@ -69,6 +69,8 @@ def _defaults() -> dict[str, dict[str, Any]]:
             "temperature": config.LLM_TEMPERATURE,
             "max_tokens": config.LLM_MAX_TOKENS,
             "tool_dispatch": config.LLM_TOOL_DISPATCH,
+            "history_max_messages": config.HISTORY_MAX_MESSAGES,
+            "history_max_chars": config.HISTORY_MAX_CHARS,
         },
         "turn": {
             "endpoint_silence_ms": config.ENDPOINT_SILENCE_MS,
@@ -77,6 +79,7 @@ def _defaults() -> dict[str, dict[str, Any]]:
             "vad_aggressiveness": config.VAD_AGGRESSIVENESS,
             "partial_interrupt_after_s": config.PARTIAL_INTERRUPT_AFTER_S,
             "filler": config.THINKING_FILLER,
+            "fallback_line": config.FALLBACK_LINE,
         },
     }
 

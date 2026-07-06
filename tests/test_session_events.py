@@ -184,6 +184,35 @@ async def test_tool_audit_events(rig):
         ("send_brochure", "whatsapp api down")]
 
 
+async def test_empty_reply_emits_fallback_spoken(rig):
+    sess, bus, rec = rig()
+    sess._llm.replies = [[]]
+    await sess._dispatch(START)
+    await sess._speak_task
+    await sess._dispatch(PlaybackFinished())
+    await _user_turn(sess, "hello?")
+    await bus.flush()
+
+    fallback = rec.only(events.FallbackSpoken)
+    assert [(e.call_id, e.turn_seq) for e in fallback] == [("c1", 1)]
+    turn = rec.only(events.TurnCompleted)[0]
+    assert turn.agent_text == "" and not turn.interrupted
+
+
+async def test_stt_dead_emits_provider_failed_alarm(rig):
+    sess, bus, rec = rig()
+    await sess._dispatch(START)
+    await sess._speak_task
+
+    await sess.stt.on_event(STTEvent(kind="dead", text=""))
+    await bus.flush()
+
+    alarms = rec.only(events.ProviderFailed)
+    assert len(alarms) == 1
+    assert alarms[0].provider == "stt"
+    assert alarms[0].call_id == "c1"
+
+
 async def test_run_lifecycle_emits_call_ended_and_session_closed(rig):
     sess, bus, rec = rig()
     sess.transport.feed(START)

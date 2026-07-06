@@ -28,15 +28,16 @@ def make_call(to: str, from_: str, agent: str | None = None) -> None:
         "X-Auth-ID": config.VOBIZ_AUTH_ID,
         "X-Auth-Token": config.VOBIZ_AUTH_TOKEN,
     }
-    answer_url = f"https://{config.PUBLIC_HOST}/answer"
+    # All webhook routes require the shared secret since M8 (D10).
+    answer_url = f"https://{config.PUBLIC_HOST}/answer?token={config.WS_AUTH_TOKEN}"
     if agent:
-        answer_url += f"?agent={agent}"
+        answer_url += f"&agent={agent}"
     payload = {
         "from": from_,
         "to": to,
         "answer_url": answer_url,
         "answer_method": "POST",
-        "hangup_url": f"https://{config.PUBLIC_HOST}/hangup",
+        "hangup_url": f"https://{config.PUBLIC_HOST}/hangup?token={config.WS_AUTH_TOKEN}",
         "hangup_method": "POST",
     }
     r = httpx.post(url, json=payload, headers=headers, timeout=20)

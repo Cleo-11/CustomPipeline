@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from typing import Any
 
 import httpx
@@ -18,6 +19,12 @@ from runtime.interfaces import OnSTTEvent
 from runtime.types import AudioFrame, STTEvent
 
 log = logging.getLogger("providers.stt.deepgram")
+
+# Reconnect budget (M8/D5): jittered exponential backoff, then give up
+# and report the call deaf. Module constants so tests can compress time.
+RECONNECT_ATTEMPTS = 5
+RECONNECT_BASE_DELAY_S = 0.5
+RECONNECT_MAX_DELAY_S = 4.0
 
 def _build_url(model: str, language: str) -> str:
     """Model/language come from the agent's STT policy; the rest of the
@@ -55,6 +62,7 @@ class DeepgramSTT:
         self._ws: Any = None
         self._closed = False
         self._reader: asyncio.Task | None = None
+        self._reconnect_task: asyncio.Task | None = None
 
     async def healthy(self) -> bool:
         """SupportsHealth probe: Deepgram's REST /v1/projects with our key —
@@ -70,16 +78,45 @@ class DeepgramSTT:
             return False
 
     async def start(self) -> None:
+        """Connect once, without blocking the call on failure: the greeting
+        must not wait on a retry loop, so recovery runs in the background
+        (D5 fixed — the call is no longer silently deaf)."""
+        if not await self._connect():
+            self._schedule_reconnect()
+
+    async def _connect(self) -> bool:
         try:
             self._ws = await websockets.connect(
                 self._url,
                 additional_headers={"Authorization": f"Token {self._api_key}"},
             )
             self._reader = asyncio.create_task(self._read_loop(), name="dg-reader")
-            log.info("STT connected (Deepgram nova-2)")
+            log.info("STT connected")
+            return True
         except Exception as e:  # noqa: BLE001
-            # D5: the call proceeds deaf if this fails — reconnect lands in M8.
             log.error("STT connect failed: %s", e)
+            return False
+
+    def _schedule_reconnect(self) -> None:
+        if self._closed or (
+                self._reconnect_task and not self._reconnect_task.done()):
+            return
+        self._reconnect_task = asyncio.create_task(
+            self._reconnect(), name="dg-reconnect")
+
+    async def _reconnect(self) -> None:
+        for attempt in range(1, RECONNECT_ATTEMPTS + 1):
+            delay = min(RECONNECT_BASE_DELAY_S * 2 ** (attempt - 1),
+                        RECONNECT_MAX_DELAY_S)
+            await asyncio.sleep(delay * (0.5 + random.random()))  # jitter
+            if self._closed:
+                return
+            if await self._connect():
+                log.info("STT reconnected on attempt %d", attempt)
+                return
+        log.error("STT reconnect exhausted after %d attempts — call is deaf",
+                  RECONNECT_ATTEMPTS)
+        await self._on_event(STTEvent(kind="dead", text=""))
 
     async def _read_loop(self) -> None:
         try:
@@ -104,9 +141,15 @@ class DeepgramSTT:
                     await self._on_event(STTEvent(kind="endpoint", text=""))
 
         except asyncio.CancelledError:
-            pass
+            return
         except Exception as e:  # noqa: BLE001
-            log.info("STT reader ended: %s", e)
+            log.warning("STT reader ended: %s", e)
+        # The socket closed mid-call (server hangup or error above). Frames
+        # arriving during the outage are dropped by send_audio; transcripts
+        # resume when the reconnect lands.
+        if not self._closed:
+            self._ws = None
+            self._schedule_reconnect()
 
     async def send_audio(self, frame: AudioFrame) -> None:
         if self._closed or self._ws is None:
@@ -118,8 +161,9 @@ class DeepgramSTT:
 
     async def close(self) -> None:
         self._closed = True
-        if self._reader:
-            self._reader.cancel()
+        for task in (self._reader, self._reconnect_task):
+            if task:
+                task.cancel()
         if self._ws is not None:
             try:
                 await self._ws.close()
